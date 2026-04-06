@@ -1,0 +1,6 @@
+# Local secrets
+.env
+
+# Local memory files
+memory_1.md
+memory_2.md
