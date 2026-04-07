@@ -1557,6 +1557,15 @@ def chat():
         f"Model: {OLLAMA_MODEL} | Docs indexed: {doc_count} | Memory turns: {mem_count}\n"
         f"Commands: /web, /fetch, /weather, /cve, /dns, /strategy, /providers, /export, /help, /monitor, /clear, exit"
     )
+    console.print(
+        Panel(
+            f"Model: {OLLAMA_MODEL}\n"
+            f"Docs indexed: {doc_count} | Memory turns: {mem_count}\n"
+            "Commands: /web, /fetch, /weather, /cve, /dns, /strategy, /providers, /export, /help, /monitor, /clear, exit",
+            title="RAG CLI",
+            border_style="cyan",
+        )
+    )
 
     missing_keys = []
     default_providers = parse_provider_list(WEB_SEARCH_DEFAULT_PROVIDERS) or [WEB_SEARCH_PROVIDER]
@@ -1571,9 +1580,12 @@ def chat():
     if not OPENWEATHER_API_KEY:
         missing_keys.append("OPENWEATHER_API_KEY")
     if missing_keys:
-        history.append(
-            f"**Warning:** Missing prerequisites: {', '.join(missing_keys)}. Some tools may return errors until configured."
+        warning_msg = (
+            f"Warning: Missing prerequisites: {', '.join(missing_keys)}. "
+            "Some tools may return errors until configured."
         )
+        history.append(f"**{warning_msg}**")
+        console.print(f"[yellow]{warning_msg}[/yellow]")
 
     while True:
         try:
@@ -1602,6 +1614,7 @@ def chat():
         if not cmd and is_meta_web_capability_question(cleaned_query):
             direct = capability_response_template()
             history.append(f"**Assistant:** {direct}")
+            console.print(f"Assistant: {direct}")
             session_recorder.add_turn(query, direct, tools=[])
             save_memory(query, direct, embedder, memory_col)
             turn_count += 1
@@ -1612,6 +1625,7 @@ def chat():
         if not cmd and is_command_help_question(cleaned_query):
             direct = command_help_response(cleaned_query)
             history.append(f"**Assistant:** {direct}")
+            console.print(f"Assistant: {direct}")
             session_recorder.add_turn(query, direct, tools=[])
             save_memory(query, direct, embedder, memory_col)
             turn_count += 1
@@ -1642,47 +1656,57 @@ def chat():
             elif cmd == "monitor":
                 sub = (arg or "status").strip().lower()
                 if sub in ("status", ""):
-                    history.append(f"**Monitor:** {monitor.status_line()}")
+                    monitor_msg = f"Monitor: {monitor.status_line()}"
                 elif sub == "on":
                     monitor.start()
-                    history.append("**Monitor enabled.**")
+                    monitor_msg = "Monitor enabled."
                 elif sub == "off":
                     monitor.stop()
-                    history.append("**Monitor disabled.**")
+                    monitor_msg = "Monitor disabled."
                 elif sub in ("live on", "live:on", "live=on"):
                     monitor.set_live(True)
-                    history.append("**Monitor live mode enabled.**")
+                    monitor_msg = "Monitor live mode enabled."
                 elif sub in ("live off", "live:off", "live=off"):
                     monitor.set_live(False)
-                    history.append("**Monitor live mode disabled.**")
+                    monitor_msg = "Monitor live mode disabled."
                 elif sub == "reset":
                     monitor.reset_peaks()
-                    history.append("**Monitor peaks reset.**")
+                    monitor_msg = "Monitor peaks reset."
                 else:
-                    history.append("Usage: /monitor status|on|off|live on|live off|reset")
+                    monitor_msg = "Usage: /monitor status|on|off|live on|live off|reset"
+                history.append(f"**{monitor_msg}**")
+                console.print(monitor_msg)
                 continue
             elif cmd == "strategy":
                 strategy_query = arg or cleaned_query
                 planned, reason = plan_web_strategy(strategy_query)
-                history.append(
-                    f"**Strategy:** {reason}\nPlanned providers: {', '.join(planned) if planned else 'none available'}"
+                strategy_msg = (
+                    f"Strategy: {reason}\n"
+                    f"Planned providers: {', '.join(planned) if planned else 'none available'}"
                 )
+                history.append(f"**{strategy_msg}**")
+                console.print(strategy_msg)
                 continue
             elif cmd == "providers":
-                history.append("**Provider status:**\n" + provider_status_text())
+                provider_msg = "Provider status:\n" + provider_status_text()
+                history.append(f"**{provider_msg}**")
+                console.print(provider_msg)
                 continue
             elif cmd == "help":
-                history.append(
-                    "**Help:** Use /web, /fetch, /weather, /cve, /dns, /strategy, /providers, /export, /monitor, /clear"
-                )
+                history.append("**Help panel shown.**")
+                show_help_panel()
                 continue
             elif cmd == "export":
                 fmt = (arg or "md").strip().lower()
                 if fmt not in {"md", "json"}:
-                    history.append("Usage: /export <md|json>")
+                    usage_msg = "Usage: /export <md|json>"
+                    history.append(f"**{usage_msg}**")
+                    console.print(usage_msg)
                     continue
                 target = session_recorder.export(SESSION_EXPORT_DIR, fmt=fmt)
-                history.append(f"**Session exported:** {target}")
+                export_msg = f"Session exported: {target}"
+                history.append(f"**{export_msg}**")
+                console.print(export_msg)
                 continue
         else:
             # auto-detect tools for regular queries

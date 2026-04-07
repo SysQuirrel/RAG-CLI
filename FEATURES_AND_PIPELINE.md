@@ -214,6 +214,20 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: fix(cli): restore visible RAG documentation/help output in CLI mode
+
+Commit message:
+
+fix(cli): restore visible RAG documentation/help output in CLI mode
+
+- print startup RAG CLI summary panel on chat launch (model, docs/memory counts, command list)
+- print missing-key warnings directly to CLI instead of storing them only in hidden history
+- print direct assistant responses for meta capability questions and command-help questions
+- restore visible outputs for /monitor, /strategy, /providers, and /export commands in CLI
+- route /help to show_help_panel() so the full RAG documentation/help section appears again
+- keep history recording behavior intact for session export and memory persistence
+- validate rag.py after edits (no static errors)
+
 ### 2026-04-07: feat(cli): remove TUI runtime and enforce CLI-only chat flow
 
 Commit message:
