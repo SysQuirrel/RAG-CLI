@@ -214,6 +214,20 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: fix(help): restore in-chat tool help for patterns like /cve /help and /help /cve
+
+Commit message:
+
+fix(help): restore in-chat tool help for patterns like /cve /help and /help /cve
+
+- add dedicated help-argument detector for command arguments (`help`, `/help`, `-h`, `--help`, `?`)
+- add normalized command-usage formatter that maps command tokens to COMMAND_USAGE entries
+- handle `/<tool> /help` (and equivalent) before tool execution so help is shown instead of calling the tool API
+- enhance `/help` to support command-specific usage when an argument is provided (for example `/help /cve`)
+- preserve existing global help panel behavior when `/help` is called without arguments
+- validate rag.py after changes (no syntax/parser errors; only optional BM25 unresolved import warning remains)
+- verify in live chat run: `/cve /help`, `/help /cve`, `/web /help`, and `/help` all return expected guidance
+
 ### 2026-04-07: fix(runtime): resolve rag.py startup crash and improve /web grounding quality
 
 Commit message:

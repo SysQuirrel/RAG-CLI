@@ -1652,6 +1652,19 @@ def _command_help_response(query: str) -> str:
     return "\n".join(f"{cmd}: {COMMAND_USAGE[cmd]}" for cmd in mentions)
 
 
+def _is_help_arg(arg: str) -> bool:
+    token = (arg or "").strip().lower()
+    return token in {"help", "/help", "-h", "--help", "?"}
+
+
+def _command_usage_line(cmd: str) -> str:
+    key = f"/{cmd.lstrip('/').lower()}"
+    usage = COMMAND_USAGE.get(key)
+    if usage:
+        return f"{key}: {usage}"
+    return "Unknown command. Use /help to see all supported commands."
+
+
 # ── Evidence tags ─────────────────────────────────────────────────────────────
 
 def _extract_web_evidence_tags(tool_results: dict[str, str], max_items: int = 6) -> list[str]:
@@ -1992,6 +2005,10 @@ def chat() -> None:
         tool_results: dict[str, str] = {}
         web_only_mode = False
         if cmd:
+            if cmd != "help" and _is_help_arg(arg):
+                console.print(_command_usage_line(cmd))
+                continue
+
             if cmd == "web":
                 web_query = arg or cleaned_query
                 selected_providers = _resolve_web_providers(web_query, interactive=True)
@@ -2033,7 +2050,10 @@ def chat() -> None:
                 console.print("Provider status:\n" + _provider_status_text())
                 continue
             elif cmd == "help":
-                _show_help_panel()
+                if arg:
+                    console.print(_command_usage_line(arg))
+                else:
+                    _show_help_panel()
                 continue
             elif cmd == "export":
                 fmt = (arg or "md").strip().lower()
