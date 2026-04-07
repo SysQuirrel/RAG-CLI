@@ -214,6 +214,19 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: fix(chat): harden slash-command routing for /help, /strategy, and related in-chat commands
+
+Commit message:
+
+fix(chat): harden slash-command routing for /help, /strategy, and related in-chat commands
+
+- replace prefix-only command parsing with regex-based slash parser that handles mixed whitespace/case consistently
+- keep the known command set explicit (/web, /fetch, /weather, /cve, /dns, /monitor, /strategy, /providers, /export, /help)
+- add explicit unknown slash-command handling so unsupported inputs do not fall through into normal Q&A
+- preserve existing command behavior and tool orchestration for supported commands
+- validate rag.py with static error checks (no errors)
+- verify in a real chat run that /help and /strategy execute, and unknown slash commands return guidance to use /help
+
 ### 2026-04-07: fix(cli): restore visible RAG documentation/help output in CLI mode
 
 Commit message:

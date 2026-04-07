@@ -1428,11 +1428,15 @@ def tool_dns(domain: str) -> str:
 def parse_command(query: str) -> tuple:
     """Return (cmd, arg, cleaned_query) for explicit /commands."""
     q = query.strip()
-    for cmd in ("/web", "/fetch", "/weather", "/cve", "/dns", "/monitor", "/strategy", "/providers", "/export", "/help"):
-        if q.lower().startswith(cmd + " ") or q.lower() == cmd:
-            arg = q[len(cmd):].strip()
-            return cmd[1:], arg, arg
-    return None, "", q
+    known = {"web", "fetch", "weather", "cve", "dns", "monitor", "strategy", "providers", "export", "help"}
+    match = re.match(r"^/([a-zA-Z]+)(?:\s+(.*))?$", q)
+    if not match:
+        return None, "", q
+    cmd = match.group(1).lower()
+    arg = (match.group(2) or "").strip()
+    if cmd not in known:
+        return None, "", q
+    return cmd, arg, arg
 
 def auto_detect_tools(query: str) -> dict:
     """Return {tool: arg} for tools that should fire automatically."""
@@ -1609,6 +1613,13 @@ def chat():
 
         # ── parse explicit commands ──
         cmd, arg, cleaned_query = parse_command(query)
+        stripped_query = query.strip()
+
+        if stripped_query.startswith("/") and not cmd:
+            unknown_msg = "Unknown command. Use /help to see all supported commands."
+            history.append(f"**{unknown_msg}**")
+            console.print(unknown_msg)
+            continue
 
         # Capability/meta checks should return a direct answer without tool execution.
         if not cmd and is_meta_web_capability_question(cleaned_query):
