@@ -214,6 +214,29 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: feat(web): add standalone web_search.py pipeline for Tavily+LangSearch+Jina discovery and Firecrawl enrichment
+
+Commit message:
+
+feat(web): add standalone web_search.py pipeline for Tavily+LangSearch+Jina discovery and Firecrawl enrichment
+
+- create new `web_search.py` as an independent experimentation pipeline for web retrieval and LLM-ready context packaging
+- implement staged retrieval design in one file:
+	1) discovery stage using Tavily, LangSearch, and Jina Search
+	2) URL dedupe/ranking stage with provider weighting and recency keyword bonus
+	3) enrichment stage using Firecrawl scrape per top URL (with Jina Reader fallback)
+	4) LLM-ready packaging stage with compact evidence blocks and source citations
+- include robust URL extraction/normalization utilities and provider-level graceful degradation when keys are missing
+- add CLI interface: `--query`, `--max-urls`, `--json-out`
+- output both human-readable summary and a machine-consumable JSON payload containing `llm_ready_context`
+- run end-to-end validation with real query (`latest AI model release updates`) and confirm discovered/enriched output is produced
+
+Integration strategy encoded in the script:
+
+- Use search providers for breadth (fresh link discovery) and crawler/reader providers for depth (clean page text).
+- Keep providers decoupled at function level and integrate through a shared URL pipeline.
+- Feed the LLM only ranked, trimmed evidence blocks with explicit source IDs to reduce context noise and hallucination risk.
+
 ### 2026-04-07: fix(help): restore in-chat tool help for patterns like /cve /help and /help /cve
 
 Commit message:
