@@ -54,6 +54,7 @@ from datetime import datetime
 # ── deps ────────────────────────────────────────────────────────────────────
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.api import ClientAPI
 import httpx                          # [FIX-8] replaces requests
 from tenacity import (                # [FIX-8] retry/backoff
     retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -218,10 +219,10 @@ CFG.data_dir.mkdir(parents=True, exist_ok=True)
 
 # ── [FIX-2] ChromaDB singleton ────────────────────────────────────────────────
 
-_chroma_client: chromadb.PersistentClient | None = None
+_chroma_client: ClientAPI | None = None
 
 
-def get_chroma() -> chromadb.PersistentClient:
+def get_chroma() -> ClientAPI:
     """Return the module-level ChromaDB client, creating it once. [FIX-2]"""
     global _chroma_client
     if _chroma_client is None:
@@ -232,7 +233,7 @@ def get_chroma() -> chromadb.PersistentClient:
     return _chroma_client
 
 
-def get_collections(client: chromadb.PersistentClient):
+def get_collections(client: ClientAPI):
     return (
         client.get_or_create_collection("documents"),
         client.get_or_create_collection("memory"),
@@ -1989,6 +1990,7 @@ def chat() -> None:
 
         # Tool execution
         tool_results: dict[str, str] = {}
+        web_only_mode = False
         if cmd:
             if cmd == "web":
                 web_query = arg or cleaned_query
@@ -1996,6 +1998,7 @@ def chat() -> None:
                 raw = tool_web_search_multi(web_query, selected_providers)
                 # [FIX-6] score and trim before storing
                 tool_results["Web search"] = _score_and_trim_web_results(raw, web_query)
+                web_only_mode = True
             elif cmd == "fetch":
                 tool_results["Fetched page"] = tool_fetch_url(arg)
             elif cmd == "weather":
@@ -2058,10 +2061,14 @@ def chat() -> None:
                     tool_results["Fetched page"] = tool_fetch_url(tool_arg)
 
         # [FIX-4] Retrieve: hybrid BM25 + dense
-        with console.status("[dim]Retrieving context...[/dim]", spinner="dots"):
-            q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
-            doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col)
-            mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
+        if web_only_mode:
+            doc_chunks = []
+            mem_turns = []
+        else:
+            with console.status("[dim]Retrieving context...[/dim]", spinner="dots"):
+                q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
+                doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col)
+                mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
 
         # Auto web fallback if no local docs
         if (

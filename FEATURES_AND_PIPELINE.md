@@ -214,6 +214,22 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: fix(runtime): resolve rag.py startup crash and improve /web grounding quality
+
+Commit message:
+
+fix(runtime): resolve rag.py startup crash and improve /web grounding quality
+
+- reproduce startup failure by running `uv run python rag.py chat` and capture traceback
+- fix crash in rag.py caused by invalid Chroma type hints (`chromadb.PersistentClient | None`) at import time
+- switch Chroma typing to `ClientAPI` (`from chromadb.api import ClientAPI`) for runtime-safe annotations
+- verify app launches successfully after fix and chat loop is reachable
+- validate slash web tooling with live run (`/providers`, `/strategy`, `/web`) to check retrieval behavior
+- improve explicit `/web` behavior by skipping local doc/memory retrieval to avoid unrelated context contamination
+- confirm explicit `/web` now uses tool results only (no local-memory bleed into answer)
+- run static diagnostics on rag.py after patch (no syntax/type parse errors apart from optional BM25 import warning)
+- note current web quality constraints: missing SERPAPI/LANGSEARCH/FIRECRAWL keys and missing `rank_bm25` package reduce breadth and hybrid quality
+
 ### 2026-04-07: chore(git): correct .gitignore configuration for Python and local runtime artifacts
 
 Commit message:
