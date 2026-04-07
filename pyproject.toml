@@ -1,7 +1,7 @@
 [project]
 name = "rag-cli"
 version = "0.1.0"
-description = "Add your description here"
+description = "Terminal RAG assistant with Chroma memory and combined Tavily/Jina/Firecrawl web grounding"
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.5",
