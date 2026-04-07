@@ -11,7 +11,7 @@ Usage:
     uv run python rag.py sources clean <files>    # clean source markdown files in place
 
 Chat commands:
-    /web <query>         force web search (single or multi-provider)
+    /web <query>         force web search (combined provider pipeline)
     /fetch <url>         fetch full page text via Jina Reader
     /weather <city>      get weather (OpenWeatherMap)
     /cve <CVE-ID>        CVE lookup from NVD
@@ -25,16 +25,16 @@ Chat commands:
     exit/quit            exit
 
 Search providers:
-    WEB_SEARCH_PROVIDER=tavily|serpapi|langsearch|jina|duckduckgo
-    WEB_SEARCH_PICK_MODE=ask|auto
-    WEB_SEARCH_DEFAULT_PROVIDERS=tavily,serpapi
+    WEB_SEARCH_PROVIDER=tavily|serpapi|langsearch|jina|firecrawl
+    WEB_SEARCH_PICK_MODE=auto
+    WEB_SEARCH_DEFAULT_PROVIDERS=tavily,serpapi,langsearch,jina,firecrawl
     - tavily: lightweight recency/news checks
     - serpapi: broad web engine results (Google-based)
-    - langsearch: long-form markdown summaries for research context
+    - langsearch: structured search summaries with titles/links
     - jina: richer text blocks for deeper context
-    - duckduckgo: optional module fallback for general topics
+    - firecrawl: crawls pages discovered by search providers for richer extraction
 
-Note: Weather, CVE, DNS auto-trigger on relevant keywords. Web search can prompt provider multi-select and summarize combined results.
+Note: Weather, CVE, DNS auto-trigger on relevant keywords. Web search uses a default combined pipeline and summarizes merged results.
     When web data is used, answers include compact evidence tags like [web:tavily#1].
 """
 
@@ -45,7 +45,6 @@ import hashlib
 import json
 import re
 import gc
-import importlib
 import threading
 from typing import Any, cast
 from pathlib import Path
@@ -59,11 +58,8 @@ import requests
 from pypdf import PdfReader
 from rich.console import Console
 from rich.panel import Panel
-from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich.table import Table
-from rich.layout import Layout
-from rich.align import Align
 from rich import print as rprint
 from runtime_features import WebSearchCache, SessionRecorder
 
@@ -134,12 +130,15 @@ WEB_SEARCH      = True                 # set to True to auto-trigger web search
 AUTO_WEB_FALLBACK_ON_EMPTY_DOCS = env_flag("AUTO_WEB_FALLBACK_ON_EMPTY_DOCS", True)
 AUTO_WEB_MIN_QUERY_WORDS = int(os.getenv("AUTO_WEB_MIN_QUERY_WORDS", "4"))
 WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower()
-WEB_SEARCH_PICK_MODE = os.getenv("WEB_SEARCH_PICK_MODE", "ask").strip().lower()
-WEB_SEARCH_DEFAULT_PROVIDERS = os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily")
-WEB_SEARCH_MAX_PROVIDERS = int(os.getenv("WEB_SEARCH_MAX_PROVIDERS", "3"))
+WEB_SEARCH_PICK_MODE = os.getenv("WEB_SEARCH_PICK_MODE", "auto").strip().lower()
+WEB_SEARCH_DEFAULT_PROVIDERS = os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily,serpapi,langsearch,jina,firecrawl")
+WEB_SEARCH_MAX_PROVIDERS = int(os.getenv("WEB_SEARCH_MAX_PROVIDERS", "5"))
 WEB_CACHE_TTL_SEC = int(os.getenv("WEB_CACHE_TTL_SEC", "900"))
 JINA_READER_TIMEOUT_SEC = int(os.getenv("JINA_READER_TIMEOUT_SEC", "12"))
 FETCH_MAX_CHARS = int(os.getenv("FETCH_MAX_CHARS", "9000"))
+FIRECRAWL_BASE_URL = os.getenv("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
+FIRECRAWL_MAX_URLS = int(os.getenv("FIRECRAWL_MAX_URLS", "4"))
 TAVILY_API_KEY        = os.getenv("TAVILY_API_KEY", "")
 SERPAPI_API_KEY       = os.getenv("SERPAPI_API_KEY", "")
 LANGSEARCH_API_KEY    = os.getenv("LANGSEARCH_API_KEY", "")
@@ -188,10 +187,13 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", TAVILY_API_KEY)
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", SERPAPI_API_KEY)
 LANGSEARCH_API_KEY = os.getenv("LANGSEARCH_API_KEY", LANGSEARCH_API_KEY)
 JINA_API_KEY = os.getenv("JINA_API_KEY", JINA_API_KEY)
+FIRECRAWL_BASE_URL = os.getenv("FIRECRAWL_BASE_URL", FIRECRAWL_BASE_URL).rstrip("/")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", FIRECRAWL_API_KEY)
 WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", WEB_SEARCH_PROVIDER).strip().lower()
 WEB_SEARCH_PICK_MODE = os.getenv("WEB_SEARCH_PICK_MODE", WEB_SEARCH_PICK_MODE).strip().lower()
 WEB_SEARCH_DEFAULT_PROVIDERS = os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", WEB_SEARCH_DEFAULT_PROVIDERS)
 WEB_SEARCH_MAX_PROVIDERS = int(os.getenv("WEB_SEARCH_MAX_PROVIDERS", str(WEB_SEARCH_MAX_PROVIDERS)))
+FIRECRAWL_MAX_URLS = int(os.getenv("FIRECRAWL_MAX_URLS", str(FIRECRAWL_MAX_URLS)))
 WEB_CACHE_TTL_SEC = int(os.getenv("WEB_CACHE_TTL_SEC", str(WEB_CACHE_TTL_SEC)))
 WEB_CACHE.ttl_sec = max(60, WEB_CACHE_TTL_SEC)
 RESOURCE_MONITOR_ENABLED = env_flag("RESOURCE_MONITOR_ENABLED", RESOURCE_MONITOR_ENABLED)
@@ -777,7 +779,7 @@ def extract_first_url(text: str) -> str:
     match = re.search(r"https?://[^\s)]+", text)
     return match.group(0) if match else ""
 
-WEB_PROVIDER_ORDER = ["tavily", "serpapi", "langsearch", "jina", "duckduckgo"]
+WEB_PROVIDER_ORDER = ["tavily", "serpapi", "langsearch", "jina", "firecrawl"]
 
 def parse_provider_list(raw: str) -> list[str]:
     providers = []
@@ -787,13 +789,6 @@ def parse_provider_list(raw: str) -> list[str]:
             providers.append(p)
     return providers
 
-def has_duckduckgo_module() -> bool:
-    try:
-        importlib.import_module("ddgs")
-        return True
-    except Exception:
-        return False
-
 def provider_unavailable_reason(provider: str) -> str | None:
     if provider == "tavily" and not TAVILY_API_KEY:
         return "missing TAVILY_API_KEY"
@@ -801,8 +796,8 @@ def provider_unavailable_reason(provider: str) -> str | None:
         return "missing SERPAPI_API_KEY"
     if provider == "langsearch" and not LANGSEARCH_API_KEY:
         return "missing LANGSEARCH_API_KEY"
-    if provider == "duckduckgo" and not has_duckduckgo_module():
-        return "install optional ddgs package"
+    if provider == "firecrawl" and not FIRECRAWL_API_KEY:
+        return "missing FIRECRAWL_API_KEY"
     return None
 
 def provider_is_available(provider: str) -> bool:
@@ -815,79 +810,28 @@ def get_available_web_providers(candidates: list[str] | None = None) -> list[str
 def provider_rules_text() -> str:
     return (
         "Provider rules:\n"
-        "- tavily: lightweight recency/news checks and quick confirmation.\n"
-        "- serpapi: broad, fast web engine results for mainstream info lookups.\n"
-        "- langsearch: long-form markdown summaries and retrieval-friendly outputs.\n"
-        "- jina: deeper context blocks when richer text is needed.\n"
-        "- duckduckgo: general fallback with no key (optional ddgs dependency)."
+        "- tavily: lightweight discovery and recency-focused snippets with source URLs.\n"
+        "- serpapi: broad Google-based discovery; used automatically when key is available.\n"
+        "- langsearch: structured, retrieval-friendly summaries for long-form context.\n"
+        "- jina: semantic web search summary for broader context expansion.\n"
+        "- firecrawl: crawl/scrape discovered URLs for cleaner page-level evidence."
     )
 
 def default_web_provider_selection() -> list[str]:
     configured = parse_provider_list(WEB_SEARCH_DEFAULT_PROVIDERS)
     if not configured:
-        configured = parse_provider_list(WEB_SEARCH_PROVIDER) or ["tavily"]
+        configured = ["tavily", "serpapi", "langsearch", "jina", "firecrawl"]
     configured = configured[: max(1, WEB_SEARCH_MAX_PROVIDERS)]
     available = get_available_web_providers(configured)
-    return available or get_available_web_providers(["jina", "tavily", "serpapi", "langsearch", "duckduckgo"])
+    if available:
+        return available
+    # Keep Jina as no-key fallback when all key-backed providers are unavailable.
+    return ["jina"]
 
 def plan_web_strategy(query: str) -> tuple[list[str], str]:
-    q = query.lower()
-    # News/recency questions benefit from lightweight + broad engines.
-    if any(k in q for k in ["latest", "recent", "today", "current", "breaking", "update", "updates"]):
-        candidates = ["tavily", "serpapi", "jina"]
-        reason = "recency strategy (news/current-events focus)"
-    # Long-form understanding benefits from richer summarizing providers.
-    elif any(k in q for k in ["analysis", "analyze", "deep", "research", "compare", "history", "background", "explain"]):
-        candidates = ["langsearch", "jina", "tavily"]
-        reason = "research strategy (long-form context focus)"
-    # Practical troubleshooting queries often map well to broad search first.
-    elif any(k in q for k in ["error", "fix", "issue", "bug", "github", "stackoverflow", "docs", "api"]):
-        candidates = ["serpapi", "tavily", "jina"]
-        reason = "troubleshooting strategy (broad web recall focus)"
-    else:
-        candidates = default_web_provider_selection()
-        reason = "default strategy (balanced)"
-
-    planned = get_available_web_providers(candidates)
-    if not planned:
-        planned = default_web_provider_selection()
-        reason = f"{reason}; fallback to available defaults"
-    planned = planned[: max(1, WEB_SEARCH_MAX_PROVIDERS)]
-    return planned, reason
-
-def prompt_select_web_providers(query: str, preferred: list[str] | None = None) -> list[str]:
-    options = WEB_PROVIDER_ORDER[:]
-    default_selected = preferred or default_web_provider_selection()
-    default_indexes = []
-    for i, p in enumerate(options):
-        if p in default_selected:
-            default_indexes.append(str(i + 1))
-    default_value = ",".join(default_indexes) if default_indexes else "1"
-
-    console.print("[dim]Web lookup needed. Pick provider(s) by number (comma-separated).[/dim]")
-    for i, p in enumerate(options, start=1):
-        reason = provider_unavailable_reason(p)
-        status = "ready" if reason is None else f"unavailable: {reason}"
-        console.print(f"[dim]  {i}. {p} ({status})[/dim]")
-
-    while True:
-        raw = Prompt.ask("Providers", default=default_value).strip()
-        try:
-            picked = []
-            for token in [t.strip() for t in raw.split(",") if t.strip()]:
-                idx = int(token)
-                if idx < 1 or idx > len(options):
-                    raise ValueError
-                p = options[idx - 1]
-                if p not in picked:
-                    picked.append(p)
-            picked = picked[: max(1, WEB_SEARCH_MAX_PROVIDERS)]
-            available = get_available_web_providers(picked)
-            if available:
-                return available
-            console.print("[yellow]None of the selected providers are available. Pick again.[/yellow]")
-        except ValueError:
-            console.print("[yellow]Use provider numbers like 1,2[/yellow]")
+    selected = default_web_provider_selection()
+    reason = "default combined pipeline (Tavily + SerpAPI-if-key + LangSearch + Jina + Firecrawl)"
+    return selected, reason
 
 def show_provider_status() -> None:
     table = Table(title="Web Provider Status")
@@ -940,31 +884,6 @@ def show_help_panel() -> None:
         title="RAG CLI Help",
         border_style="cyan",
     ))
-
-def render_tui_frame(history: list[str], monitor: ResourceMonitor, footer: str = "") -> None:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="body", ratio=1),
-        Layout(name="footer", size=3),
-    )
-    monitor_line = monitor.status_line() if monitor.enabled else "Monitor: off"
-    layout["header"].update(
-        Panel(
-            Align.left(f"RAG TUI | Model: {OLLAMA_MODEL} | {monitor_line}"),
-            border_style="cyan",
-        )
-    )
-    body_text = "\n\n".join(history[-16:]) if history else "No messages yet."
-    layout["body"].update(Panel(Markdown(body_text), title="Conversation", border_style="green"))
-    layout["footer"].update(
-        Panel(
-            footer or "Type a message or use /help for commands.",
-            border_style="magenta",
-        )
-    )
-    console.clear()
-    console.print(layout)
 
 COMMAND_USAGE = {
     "/web": "Force a web lookup for your query. Example: /web latest CVE updates for nginx",
@@ -1034,9 +953,8 @@ def command_help_response(query: str) -> str:
 
 def resolve_web_providers_for_query(query: str, interactive: bool) -> list[str]:
     planned, reason = plan_web_strategy(query)
-    if interactive and WEB_SEARCH_PICK_MODE == "ask":
-        console.print(f"[dim]Strategy suggestion: {reason} -> {', '.join(planned)}[/dim]")
-        return prompt_select_web_providers(query, preferred=planned)
+    if interactive:
+        console.print(f"[dim]Strategy: {reason} -> {', '.join(planned)}[/dim]")
     return planned
 
 def extract_web_evidence_tags(tool_results: dict[str, str], max_items: int = 6) -> list[str]:
@@ -1128,7 +1046,7 @@ def is_tool_result_usable(content: str) -> bool:
         "[serpapi error]",
         "[langsearch error]",
         "[jina error]",
-        "[duckduckgo error]",
+        "[firecrawl error]",
         "[fetch error]",
         "[weather error]",
         "[cve error]",
@@ -1140,17 +1058,22 @@ def is_tool_result_usable(content: str) -> bool:
 # TOOL FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 1. Web search tools (Tavily / SerpAPI / LangSearch / Jina) ──────────────
+# ── 1. Web search tools (Tavily / SerpAPI / Jina / Firecrawl) ───────────────
 def tool_tavily_search(query: str) -> str:
     if not TAVILY_API_KEY:
         return "[Tavily] No API key set. Run: export TAVILY_API_KEY=tvly-..."
     try:
         from tavily import TavilyClient
-        res      = TavilyClient(api_key=TAVILY_API_KEY).search(
+        res = TavilyClient(api_key=TAVILY_API_KEY).search(
             query, max_results=3, search_depth="basic"
         )
-        snippets = [r.get("content", "") for r in res.get("results", [])]
-        return "\n\n".join(snippets[:3]) or "No results."
+        lines = []
+        for item in res.get("results", [])[:5]:
+            title = item.get("title") or "(no title)"
+            url = item.get("url") or ""
+            snippet = item.get("content") or ""
+            lines.append(f"- {title}\n  URL: {url}\n  Snippet: {snippet}")
+        return "\n\n".join(lines) or "No results."
     except Exception as e:
         return f"[Tavily error] {e}"
 
@@ -1228,6 +1151,61 @@ def tool_jina_search(query: str) -> str:
     except Exception as e:
         return f"[Jina error] {e}"
 
+def extract_candidate_urls_from_text(text: str, limit: int = 12) -> list[str]:
+    urls = []
+    for match in re.findall(r"https?://[^\s)]+", text or ""):
+        clean = match.rstrip(".,;)")
+        if clean.startswith("https://s.jina.ai") or clean.startswith("https://r.jina.ai"):
+            continue
+        if clean not in urls:
+            urls.append(clean)
+        if len(urls) >= limit:
+            break
+    return urls
+
+def tool_firecrawl_scrape_url(url: str) -> str:
+    if not FIRECRAWL_API_KEY:
+        return "[Firecrawl] No API key set. Run: export FIRECRAWL_API_KEY=..."
+    normalized = ensure_http_url(url)
+    if not normalized:
+        return "[Firecrawl error] Missing URL."
+    try:
+        r = requests.post(
+            f"{FIRECRAWL_BASE_URL}/v1/scrape",
+            headers={
+                "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "url": normalized,
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+            },
+            timeout=max(12, JINA_READER_TIMEOUT_SEC),
+        )
+        if r.status_code not in (200, 201):
+            return f"[Firecrawl error] HTTP {r.status_code}: {r.text[:240]}"
+        payload = r.json() if r.text else {}
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        markdown = data.get("markdown") if isinstance(data, dict) else ""
+        excerpt = (markdown or "")[:FETCH_MAX_CHARS]
+        if not excerpt:
+            return f"[Firecrawl] Empty extraction for {normalized}"
+        return f"URL: {normalized}\n{excerpt}"
+    except Exception as e:
+        return f"[Firecrawl error] {e}"
+
+def tool_firecrawl_search(query: str) -> str:
+    # Firecrawl needs concrete URLs, so discover URLs first with Tavily.
+    seed = tool_tavily_search(query)
+    urls = extract_candidate_urls_from_text(seed, limit=max(1, FIRECRAWL_MAX_URLS))
+    if not urls:
+        return "[Firecrawl] No crawlable URLs discovered from Tavily seed results."
+    sections = []
+    for url in urls:
+        sections.append(tool_firecrawl_scrape_url(url))
+    return "\n\n".join(sections)
+
 def tool_fetch_url(url: str) -> str:
     normalized = ensure_http_url(url)
     if not normalized:
@@ -1251,25 +1229,6 @@ def tool_fetch_url(url: str) -> str:
     except Exception as e:
         return f"[Fetch error] {e}"
 
-def tool_duckduckgo_search(query: str) -> str:
-    try:
-        ddg_mod = importlib.import_module("ddgs")
-        DDGS = getattr(ddg_mod, "DDGS")
-    except Exception:
-        return "[DuckDuckGo error] Optional dependency missing: ddgs. Ask for approval before installing: uv add ddgs"
-
-    try:
-        rows = []
-        with DDGS() as ddgs:
-            for item in ddgs.text(query, max_results=5):
-                title = item.get("title", "(no title)")
-                url = item.get("href", "")
-                body = item.get("body", "")
-                rows.append(f"- {title}\n  URL: {url}\n  Snippet: {body}")
-        return "\n\n".join(rows) or "No results."
-    except Exception as e:
-        return f"[DuckDuckGo error] {e}"
-
 def tool_web_search(query: str, provider: str | None = None) -> str:
     selected = (provider or WEB_SEARCH_PROVIDER).strip().lower()
     if selected == "serpapi":
@@ -1280,9 +1239,9 @@ def tool_web_search(query: str, provider: str | None = None) -> str:
         return tool_jina_search(query)
     if selected == "tavily":
         return tool_tavily_search(query)
-    if selected == "duckduckgo":
-        return tool_duckduckgo_search(query)
-    return f"[Web search] Unsupported provider '{selected}'. Use tavily|serpapi|langsearch|jina|duckduckgo."
+    if selected == "firecrawl":
+        return tool_firecrawl_search(query)
+    return f"[Web search] Unsupported provider '{selected}'. Use tavily|serpapi|langsearch|jina|firecrawl."
 
 def tool_web_search_multi(query: str, providers: list[str]) -> str:
     selected = []
@@ -1299,9 +1258,34 @@ def tool_web_search_multi(query: str, providers: list[str]) -> str:
         return f"[Web search cache hit <= {WEB_CACHE_TTL_SEC}s]\n\n{cached}"
 
     sections = [provider_rules_text(), f"Selected providers: {', '.join(selected)}"]
+    discovered_urls: list[str] = []
+
+    # Search-first phase (collect URLs from providers that return references).
     for p in selected:
+        if p == "firecrawl":
+            continue
         result = tool_web_search(query, provider=p)
         sections.append(f"=== {p} ===\n{result}")
+        discovered_urls.extend(extract_candidate_urls_from_text(result, limit=24))
+
+    # Crawl phase using URLs discovered from search results.
+    if "firecrawl" in selected:
+        unique_urls = []
+        for url in discovered_urls:
+            if url not in unique_urls:
+                unique_urls.append(url)
+        firecrawl_targets = unique_urls[: max(1, FIRECRAWL_MAX_URLS)]
+        if not firecrawl_targets and "tavily" not in selected:
+            seed = tool_tavily_search(query)
+            sections.append(f"=== tavily_seed ===\n{seed}")
+            firecrawl_targets = extract_candidate_urls_from_text(seed, limit=max(1, FIRECRAWL_MAX_URLS))
+
+        if firecrawl_targets:
+            crawled_blocks = [tool_firecrawl_scrape_url(url) for url in firecrawl_targets]
+            sections.append("=== firecrawl ===\n" + "\n\n".join(crawled_blocks))
+        else:
+            sections.append("=== firecrawl ===\n[Firecrawl] No crawlable URLs discovered from upstream search providers.")
+
     merged = "\n\n".join(sections)
     WEB_CACHE.set(query, selected, merged, now_epoch=time.time())
     return merged
@@ -1569,7 +1553,7 @@ def chat():
     mem_count = memory_col.count()
 
     history.append(
-        f"**RAG TUI started**\n"
+        f"**RAG CLI started**\n"
         f"Model: {OLLAMA_MODEL} | Docs indexed: {doc_count} | Memory turns: {mem_count}\n"
         f"Commands: /web, /fetch, /weather, /cve, /dns, /strategy, /providers, /export, /help, /monitor, /clear, exit"
     )
@@ -1582,8 +1566,8 @@ def chat():
         missing_keys.append("SERPAPI_API_KEY")
     if WEB_SEARCH and "langsearch" in default_providers and not LANGSEARCH_API_KEY:
         missing_keys.append("LANGSEARCH_API_KEY")
-    if WEB_SEARCH and "duckduckgo" in default_providers and not has_duckduckgo_module():
-        missing_keys.append("ddgs(optional)")
+    if WEB_SEARCH and "firecrawl" in default_providers and not FIRECRAWL_API_KEY:
+        missing_keys.append("FIRECRAWL_API_KEY")
     if not OPENWEATHER_API_KEY:
         missing_keys.append("OPENWEATHER_API_KEY")
     if missing_keys:
@@ -1593,11 +1577,9 @@ def chat():
 
     while True:
         try:
-            render_tui_frame(history, monitor, footer="Enter your prompt. Use /help for command list.")
             query = Prompt.ask("\n[bold blue]You[/bold blue]").strip()
         except (KeyboardInterrupt, EOFError):
             history.append("**Session ended.**")
-            render_tui_frame(history, monitor, footer="Bye.")
             monitor.stop()
             break
 
@@ -1605,7 +1587,6 @@ def chat():
             continue
         if query.lower() in ("exit", "quit", "q"):
             history.append("**Session ended by user.**")
-            render_tui_frame(history, monitor, footer="Bye.")
             monitor.stop()
             break
         if query.lower() == "/clear":
@@ -1708,7 +1689,7 @@ def chat():
             auto_tools = auto_detect_tools(cleaned_query)
             for tool_name, tool_arg in auto_tools.items():
                 if tool_name == "web":
-                    selected_providers = resolve_web_providers_for_query(tool_arg, interactive=(WEB_SEARCH_PICK_MODE == "ask"))
+                    selected_providers = resolve_web_providers_for_query(tool_arg, interactive=False)
                     result = tool_web_search_multi(tool_arg, selected_providers)
                     tool_results["Web search"] = result
                 elif tool_name == "weather":
@@ -1743,7 +1724,7 @@ def chat():
             and len(cleaned_query.split()) >= max(1, AUTO_WEB_MIN_QUERY_WORDS)
             and len(doc_chunks) == 0
         ):
-            selected_providers = resolve_web_providers_for_query(cleaned_query, interactive=(WEB_SEARCH_PICK_MODE == "ask"))
+            selected_providers = resolve_web_providers_for_query(cleaned_query, interactive=False)
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):
                 web_result = tool_web_search_multi(cleaned_query, selected_providers)
             if web_result and not web_result.startswith("[Web search]"):
@@ -1760,7 +1741,6 @@ def chat():
 
         # ── generate ──
         prompt = build_prompt(cleaned_query, doc_chunks, mem_turns, tool_results)
-        render_tui_frame(history, monitor, footer="Generating response...")
 
         full_response = ""
         t_gen = time.time()
@@ -1810,6 +1790,8 @@ def chat():
                 footer = format_sources_footer(evidence_tags)
                 if footer:
                     full_response = f"{full_response}\n\n{footer}"
+
+            console.print(f"Assistant: {full_response}")
 
             history.append(f"**Assistant:** {full_response}")
 

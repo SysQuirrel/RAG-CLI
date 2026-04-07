@@ -31,7 +31,7 @@ Core flow:
 
 ### 2.2 Tool Integrations
 
-- Web providers: Tavily, SerpAPI, LangSearch, Jina, DuckDuckGo via ddgs.
+- Web providers: Tavily, SerpAPI, LangSearch, Jina, Firecrawl.
 - URL fetch via Jina Reader.
 - Weather lookup via OpenWeatherMap.
 - CVE lookup via NVD API.
@@ -40,24 +40,21 @@ Core flow:
 ### 2.3 Provider Selection and Strategy
 
 - /web lets you force web lookup.
-- WEB_SEARCH_PICK_MODE=ask allows interactive provider picking.
-- WEB_SEARCH_PICK_MODE=auto uses automatic strategy planning.
+- Provider choice is non-interactive by default.
+- The runtime uses a combined pipeline: Tavily + LangSearch + Jina + Firecrawl, and also SerpAPI when key is configured.
 - /strategy <query> previews selected providers and rationale.
 - /providers shows readiness/default state for each provider.
 
 Strategy types:
 
-- Recency strategy: optimized for current events.
-- Research strategy: optimized for long-form context.
-- Troubleshooting strategy: optimized for broad recall and practical debugging queries.
-- Default strategy: fallback balanced behavior.
+- Default strategy: fixed combined provider pipeline with key-aware availability checks.
 
 ### 2.4 Citation-aware Web Answers
 
 When web data is used, the system prepares evidence tags and asks the model to cite them, for example:
 
 - [web:tavily#1]
-- [web:langsearch#1]
+- [web:firecrawl#1]
 
 If a web-grounded answer is returned without citations, a second pass is triggered to add the missing tags.
 
@@ -161,6 +158,8 @@ Tool/provider behavior:
 - WEB_SEARCH_DEFAULT_PROVIDERS
 - WEB_SEARCH_MAX_PROVIDERS
 - WEB_CACHE_TTL_SEC
+- FIRECRAWL_BASE_URL
+- FIRECRAWL_MAX_URLS
 
 Provider keys:
 
@@ -168,6 +167,7 @@ Provider keys:
 - SERPAPI_API_KEY
 - LANGSEARCH_API_KEY
 - JINA_API_KEY
+- FIRECRAWL_API_KEY
 
 Other integrations:
 
@@ -206,13 +206,52 @@ runtime_features.py includes:
 
 ## 7. Recommended Operating Pattern
 
-1. Keep WEB_SEARCH_PICK_MODE=ask while tuning.
+1. Keep default combined pipeline enabled for broad coverage.
 2. Use /strategy before /web for important tasks.
 3. Use /export json for machine-readable audit logs.
 4. Use /providers to quickly diagnose missing API key issues.
 5. Run docs prune occasionally if your sources are untrusted.
 
 ## 8. Change Diary
+
+### 2026-04-07: feat(cli): remove TUI runtime and enforce CLI-only chat flow
+
+Commit message:
+
+feat(cli): remove TUI runtime and enforce CLI-only chat flow
+
+- remove TUI-only rendering path from rag.py by deleting render_tui_frame
+- remove USE_TUI feature flag and all conditional TUI branches from chat loop
+- remove unused Rich TUI imports (Markdown, Layout, Align)
+- switch startup session label from RAG TUI started to RAG CLI started
+- keep retrieval, tool orchestration, and grounding logic unchanged
+- keep assistant output consistent through direct CLI printing
+- validate rag.py with static error checks (no errors)
+- verify no remaining TUI symbols (USE_TUI, render_tui_frame, Layout, Align, RAG TUI)
+
+### 2026-04-07: Rolled Back Heavy Search Stack + Default Combined Web Pipeline
+
+Problem:
+
+- The prior setup was too heavy for local web-search runtime and required manual provider selection.
+
+What changed:
+
+- Reverted the project back to the previous lightweight commit baseline.
+- Removed SearXNG/Redis Docker image dependencies from the active flow.
+- Updated web search routing to a non-interactive default pipeline:
+	- Tavily discovery
+	- LangSearch structured summaries
+	- SerpAPI discovery (only when `SERPAPI_API_KEY` is present)
+	- Jina search context
+	- Firecrawl page extraction over discovered URLs
+- Added Firecrawl crawl orchestration that consumes URLs discovered from Tavily/SerpAPI/LangSearch/Jina outputs.
+- Updated `.env` defaults and provider descriptions to match this pipeline.
+
+Outcome:
+
+- Web search now runs with merged multi-source output by default without provider selection prompts.
+- SerpAPI remains integrated but is automatically skipped until its API key is configured.
 
 ### 2026-04-06: Command-Usage Q&A Reliability Fix
 
