@@ -214,6 +214,22 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-07: chore(git): correct .gitignore configuration for Python and local runtime artifacts
+
+Commit message:
+
+chore(git): correct .gitignore configuration for Python and local runtime artifacts
+
+- expand .gitignore from minimal entries to a complete project-safe baseline
+- keep local secret handling by preserving .env in ignored files
+- ignore Python cache/bytecode artifacts (__pycache__/, *.py[cod], *$py.class)
+- ignore local virtual environments (.venv/, venv/, env/, ENV/)
+- ignore build/package artifacts (build/, dist/, *.egg-info/, .eggs/)
+- ignore common tool caches (.pytest_cache/, .mypy_cache/, .ruff_cache/, .coverage*, htmlcov/)
+- ignore local logs and editor/OS metadata (*.log, .vscode/, .idea/, .DS_Store, Thumbs.db)
+- preserve existing project-specific memory file ignores (memory_1.md, memory_2.md)
+- validate updated .gitignore for syntax/errors (no issues)
+
 ### 2026-04-07: fix(chat): harden slash-command routing for /help, /strategy, and related in-chat commands
 
 Commit message:
