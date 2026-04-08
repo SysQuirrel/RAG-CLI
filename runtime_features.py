@@ -19,10 +19,17 @@ class CacheEntry:
 class WebSearchCache:
     """Small JSON-backed cache to reduce repeated external tool calls."""
 
-    def __init__(self, cache_path: Path, ttl_sec: int = 900, max_entries: int = 300):
+    def __init__(
+        self,
+        cache_path: Path,
+        ttl_sec: int = 900,
+        max_entries: int = 300,
+        max_value_chars: int = 12000,
+    ):
         self.cache_path = cache_path
         self.ttl_sec = max(60, int(ttl_sec))
         self.max_entries = max(50, int(max_entries))
+        self.max_value_chars = max(1000, int(max_value_chars))
         self._store: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -66,6 +73,8 @@ class WebSearchCache:
 
     def set(self, query: str, providers: list[str], value: str, now_epoch: float) -> None:
         key = self._normalize_key(query, providers)
+        if isinstance(value, str) and len(value) > self.max_value_chars:
+            value = value[: self.max_value_chars]
         self._store[key] = {
             "query": query,
             "providers": providers,
@@ -85,8 +94,9 @@ class WebSearchCache:
 class SessionRecorder:
     """Capture turns and export in json or markdown."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_turns: int = 250) -> None:
         self.started_at = utc_now_iso()
+        self.max_turns = max(20, int(max_turns))
         self.turns: list[dict[str, Any]] = []
 
     def add_turn(
@@ -105,6 +115,8 @@ class SessionRecorder:
                 "gen_time_sec": gen_time_sec,
             }
         )
+        if len(self.turns) > self.max_turns:
+            self.turns = self.turns[-self.max_turns :]
 
     def to_json_text(self) -> str:
         payload = {

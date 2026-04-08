@@ -423,3 +423,31 @@ Outcome:
 
 - Fewer accidental local artifacts will show up in git status.
 - Source files and project docs remain unaffected.
+
+### 2026-04-08: Web Pipeline Memory Stabilization
+
+Problem:
+
+- Web/news queries caused sharp RAM growth when large search + crawl payloads were passed through the pipeline and combined with a large model context window.
+
+What changed:
+
+- Reduced default runtime memory pressure for web-heavy turns in `rag.py`:
+	- lowered default `OLLAMA_CHAT_NUM_CTX` to 8192
+	- added `OLLAMA_CHAT_NUM_CTX_WEB` with lower web-turn context (default 6144)
+	- reduced default provider fan-out to `tavily,firecrawl`
+	- reduced default `FIRECRAWL_MAX_URLS` to 2
+- Added strict payload caps:
+	- `FIRECRAWL_EXTRACT_MAX_CHARS` for per-URL extracted content
+	- clipped provider outputs before aggregation
+	- cache now stores compact web evidence instead of large raw merged blocks
+	- web cache entries are bounded with `WEB_CACHE_MAX_VALUE_CHARS`
+- Added in-memory retention limits to prevent growth over long sessions:
+	- `SessionRecorder(max_turns=...)` now trims old turns
+	- conversation history stores clipped text per turn
+
+Outcome:
+
+- Web search turns now allocate less Python-side memory and send a smaller prompt to Ollama.
+- The runtime avoids unbounded growth in session/cache structures during long chats.
+- News/current-events queries should no longer cause runaway RAM spikes as quickly as before.

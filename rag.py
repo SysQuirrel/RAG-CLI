@@ -141,10 +141,11 @@ class Config:
     use_gpu: bool = field(default_factory=_detect_cuda)
 
     # ollama / generation
-    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))
+    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen3.5:4b-q4_K_M"))
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
-    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 4096))
+    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 8192))
+    ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))
     ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 700))
     ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.1))
     ollama_keep_alive: str = "10m"
@@ -181,20 +182,23 @@ class Config:
     auto_web_min_query_words: int = field(default_factory=lambda: _env_int("AUTO_WEB_MIN_QUERY_WORDS", 4))
     web_search_provider: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower())
     web_search_pick_mode: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PICK_MODE", "auto").strip().lower())
-    web_search_default_providers: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily,serpapi,langsearch,jina,firecrawl"))
-    web_search_max_providers: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_PROVIDERS", 5))
+    web_search_default_providers: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily,firecrawl"))
+    web_search_max_providers: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_PROVIDERS", 3))
     web_cache_ttl_sec: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SEC", 900))
+    web_cache_max_value_chars: int = field(default_factory=lambda: _env_int("WEB_CACHE_MAX_VALUE_CHARS", 8000))
     # [FIX-6] limit web snippet chars per provider before injection
     web_snippet_max_chars: int = field(default_factory=lambda: _env_int("WEB_SNIPPET_MAX_CHARS", 600))
     web_top_snippets: int = field(default_factory=lambda: _env_int("WEB_TOP_SNIPPETS", 5))
     jina_reader_timeout_sec: int = field(default_factory=lambda: _env_int("JINA_READER_TIMEOUT_SEC", 12))
     fetch_max_chars: int = field(default_factory=lambda: _env_int("FETCH_MAX_CHARS", 9000))
+    firecrawl_extract_max_chars: int = field(default_factory=lambda: _env_int("FIRECRAWL_EXTRACT_MAX_CHARS", 1200))
     firecrawl_base_url: str = field(default_factory=lambda: os.getenv("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/"))
     firecrawl_api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", ""))
-    firecrawl_max_urls: int = field(default_factory=lambda: _env_int("FIRECRAWL_MAX_URLS", 4))
+    firecrawl_max_urls: int = field(default_factory=lambda: _env_int("FIRECRAWL_MAX_URLS", 2))
 
     # [FIX-10] conversation sliding window: number of past (user, assistant) turns to include
     conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 6))
+    session_recorder_max_turns: int = field(default_factory=lambda: _env_int("SESSION_RECORDER_MAX_TURNS", 250))
 
     # API keys
     tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
@@ -243,7 +247,11 @@ def get_collections(client: ClientAPI):
 # ── Globals ───────────────────────────────────────────────────────────────────
 console = Console()
 OLLAMA_CLIENT = ollama.Client(host=CFG.ollama_host)
-WEB_CACHE = WebSearchCache(CFG.data_dir / "web_cache.json", ttl_sec=CFG.web_cache_ttl_sec)
+WEB_CACHE = WebSearchCache(
+    CFG.data_dir / "web_cache.json",
+    ttl_sec=CFG.web_cache_ttl_sec,
+    max_value_chars=CFG.web_cache_max_value_chars,
+)
 
 # ── [FIX-8] HTTP client with retry/backoff ────────────────────────────────────
 
@@ -747,6 +755,16 @@ def _score_and_trim_web_results(raw: str, query: str) -> str:
     return "\n\n".join(top)
 
 
+def _clip_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
 # ── [FIX-5, FIX-9, FIX-10] Prompt builder ────────────────────────────────────
 
 SYSTEM_PROMPT = (
@@ -828,6 +846,7 @@ def generate_chat_response(
     messages: list[dict],
     temperature: float,
     num_predict: int,
+    num_ctx: int,
     stream: bool = False,
 ) -> str:
     """Send messages array to Ollama. [FIX-10] uses full message history."""
@@ -837,7 +856,7 @@ def generate_chat_response(
         stream=stream,
         options={
             "temperature": temperature,
-            "num_ctx": CFG.ollama_chat_num_ctx,
+            "num_ctx": num_ctx,
             "num_predict": num_predict,
             "num_thread": CFG.ollama_num_thread,
         },
@@ -1316,7 +1335,7 @@ def tool_firecrawl_scrape_url(url: str) -> str:
         payload = r.json() if r.text else {}
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         markdown = (data.get("markdown") or "") if isinstance(data, dict) else ""
-        excerpt = markdown[:CFG.fetch_max_chars]
+        excerpt = _clip_text(markdown, CFG.firecrawl_extract_max_chars)
         return f"URL: {normalized}\n{excerpt}" if excerpt else f"[Firecrawl] Empty extraction for {normalized}"
     except Exception as e:
         return f"[Firecrawl error] {e}"
@@ -1349,15 +1368,15 @@ def tool_fetch_url(url: str) -> str:
 
 def _tool_web_search_single(query: str, provider: str) -> str:
     if provider == "serpapi":
-        return tool_serpapi_search(query)
+        return _clip_text(tool_serpapi_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
     if provider == "langsearch":
-        return tool_langsearch_search(query)
+        return _clip_text(tool_langsearch_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
     if provider == "jina":
-        return tool_jina_search(query)
+        return _clip_text(tool_jina_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
     if provider == "tavily":
-        return tool_tavily_search(query)
+        return _clip_text(tool_tavily_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
     if provider == "firecrawl":
-        return tool_firecrawl_search(query)
+        return _clip_text(tool_firecrawl_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
     return f"[Web search] Unsupported provider '{provider}'."
 
 
@@ -1394,8 +1413,9 @@ def tool_web_search_multi(query: str, providers: list[str]) -> str:
             sections.append("=== firecrawl ===\n[Firecrawl] No crawlable URLs discovered.")
 
     merged = "\n\n".join(sections)
-    WEB_CACHE.set(query, selected, merged, now_epoch=time.time())
-    return merged
+    compact = _score_and_trim_web_results(merged, query)
+    WEB_CACHE.set(query, selected, compact, now_epoch=time.time())
+    return compact
 
 
 def web_search(query: str) -> str:
@@ -1701,6 +1721,10 @@ def _is_tool_result_usable(content: str) -> bool:
     return not any(m in content.lower() for m in failure_markers)
 
 
+def _history_text(text: str, max_chars: int = 1200) -> str:
+    return _clip_text(text or "", max_chars)
+
+
 def _response_falsely_denies_web_access(text: str) -> bool:
     lowered = (text or "").lower()
     return any(m in lowered for m in [
@@ -1907,7 +1931,7 @@ def chat() -> None:
     embedder = load_embedder()
     client = get_chroma()
     docs_col, memory_col = get_collections(client)
-    session_recorder = SessionRecorder()
+    session_recorder = SessionRecorder(max_turns=CFG.session_recorder_max_turns)
     turn_count = 0
     monitor = ResourceMonitor(interval_sec=CFG.resource_monitor_interval_sec)
     if CFG.resource_monitor_enabled:
@@ -1982,8 +2006,8 @@ def chat() -> None:
             session_recorder.add_turn(query, direct, tools=[])
             save_memory(query, direct, embedder, memory_col)
             # [FIX-10] update history
-            conversation_history.append({"role": "user", "content": query})
-            conversation_history.append({"role": "assistant", "content": direct})
+            conversation_history.append({"role": "user", "content": _history_text(query)})
+            conversation_history.append({"role": "assistant", "content": _history_text(direct)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
             turn_count += 1
             maybe_release_ram(turn_count)
@@ -1994,8 +2018,8 @@ def chat() -> None:
             console.print(f"Assistant: {direct}")
             session_recorder.add_turn(query, direct, tools=[])
             save_memory(query, direct, embedder, memory_col)
-            conversation_history.append({"role": "user", "content": query})
-            conversation_history.append({"role": "assistant", "content": direct})
+            conversation_history.append({"role": "user", "content": _history_text(query)})
+            conversation_history.append({"role": "assistant", "content": _history_text(direct)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
             turn_count += 1
             maybe_release_ram(turn_count)
@@ -2012,9 +2036,7 @@ def chat() -> None:
             if cmd == "web":
                 web_query = arg or cleaned_query
                 selected_providers = _resolve_web_providers(web_query, interactive=True)
-                raw = tool_web_search_multi(web_query, selected_providers)
-                # [FIX-6] score and trim before storing
-                tool_results["Web search"] = _score_and_trim_web_results(raw, web_query)
+                tool_results["Web search"] = tool_web_search_multi(web_query, selected_providers)
                 web_only_mode = True
             elif cmd == "fetch":
                 tool_results["Fetched page"] = tool_fetch_url(arg)
@@ -2069,8 +2091,7 @@ def chat() -> None:
             for tool_name, tool_arg in auto_tools.items():
                 if tool_name == "web":
                     selected_providers = _resolve_web_providers(tool_arg, interactive=False)
-                    raw = tool_web_search_multi(tool_arg, selected_providers)
-                    tool_results["Web search"] = _score_and_trim_web_results(raw, tool_arg)  # [FIX-6]
+                    tool_results["Web search"] = tool_web_search_multi(tool_arg, selected_providers)
                 elif tool_name == "weather":
                     tool_results["Weather"] = tool_weather(tool_arg)
                 elif tool_name == "cve":
@@ -2102,10 +2123,9 @@ def chat() -> None:
         ):
             selected_providers = _resolve_web_providers(cleaned_query, interactive=False)
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):
-                raw = tool_web_search_multi(cleaned_query, selected_providers)
-            trimmed = _score_and_trim_web_results(raw, cleaned_query)  # [FIX-6]
-            if trimmed and not trimmed.startswith("[Web search]"):
-                tool_results["Web search"] = trimmed
+                compact = tool_web_search_multi(cleaned_query, selected_providers)
+            if compact and not compact.startswith("[Web search]"):
+                tool_results["Web search"] = compact
 
         # Show sources
         if doc_chunks:
@@ -2118,6 +2138,7 @@ def chat() -> None:
 
         # [FIX-10] Build full messages array with sliding window history
         messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, conversation_history)
+        active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
 
         full_response = ""
         t_gen = time.time()
@@ -2126,6 +2147,7 @@ def chat() -> None:
                 messages,
                 temperature=CFG.ollama_chat_temperature,
                 num_predict=CFG.ollama_chat_num_predict,
+                num_ctx=active_num_ctx,
                 stream=False,
             )
 
@@ -2147,6 +2169,7 @@ def chat() -> None:
                     correction_messages,
                     temperature=CFG.ollama_chat_temperature,
                     num_predict=CFG.ollama_chat_num_predict,
+                    num_ctx=active_num_ctx,
                     stream=False,
                 )
 
@@ -2168,6 +2191,7 @@ def chat() -> None:
                     citation_messages,
                     temperature=0.0,
                     num_predict=CFG.ollama_chat_num_predict,
+                    num_ctx=active_num_ctx,
                     stream=False,
                 )
 
@@ -2179,8 +2203,8 @@ def chat() -> None:
             console.print(f"Assistant: {full_response}")
 
             # [FIX-10] Update sliding window conversation history
-            conversation_history.append({"role": "user", "content": query})
-            conversation_history.append({"role": "assistant", "content": full_response})
+            conversation_history.append({"role": "user", "content": _history_text(query)})
+            conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
 
             gen_time = time.time() - t_gen
