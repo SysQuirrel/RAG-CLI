@@ -404,3 +404,22 @@ Outcome:
 
 - Generic/non-web prompts no longer get hijacked by web-provider selection when local docs are empty.
 - Web fallback remains active for true web-intent queries.
+
+### 2026-04-08: Gitignore Cleanup for Local Artifacts
+
+Problem:
+
+- The repository ignore rules were missing several common local/temp file patterns that can appear during development.
+
+What changed:
+
+- Updated `.gitignore` with additional non-source patterns:
+	- temp/backup files (`*.tmp`, `*.temp`, `*.bak`, `*.orig`)
+	- python runtime metadata (`.python-version`)
+	- notebook checkpoints (`.ipynb_checkpoints/`)
+	- editor swap files (`*.swp`, `*.swo`, `*~`)
+
+Outcome:
+
+- Fewer accidental local artifacts will show up in git status.
+- Source files and project docs remain unaffected.

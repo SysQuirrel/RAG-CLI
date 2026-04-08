@@ -28,6 +28,21 @@ htmlcov/
 
 # Logs and local runtime output
 *.log
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Python tooling/runtime metadata
+.python-version
+
+# Notebook and interactive checkpoints
+.ipynb_checkpoints/
+
+# Vim/terminal editor swap files
+*.swp
+*.swo
+*~
 
 # IDE/editor settings
 .vscode/
