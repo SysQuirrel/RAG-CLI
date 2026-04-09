@@ -214,6 +214,18 @@ runtime_features.py includes:
 
 ## 8. Change Diary
 
+### 2026-04-09: doc/cli: document web pipeline and stream chat with quieter logs
+
+Commit message:
+
+Document web pipeline and stream chat with quieter logs
+
+- Add a dedicated README describing the modular web retrieval pipeline (config, crawler, extractor, embedder, retriever, pipeline, modal_pipeline).
+- Introduce a shared config.py with environment-driven settings for the modular pipeline, including a larger EMBEDDING_BATCH_SIZE=128 to speed up batch embedding.
+- Switch rag.py chat loop to call generate_chat_response with streaming enabled so answers appear progressively instead of in a single block.
+- Simplify post-generation passes by removing the extra rewrite calls and keeping only a lightweight Sources footer driven by web evidence tags.
+- Tighten log configuration in rag.py so huggingface_hub HTTP warnings (including transient 503 HEAD requests) are suppressed in interactive CLI runs while other libraries remain at WARNING level.
+
 ### 2026-04-07: feat(web): add standalone web_search.py pipeline for Tavily+LangSearch+Jina discovery and Firecrawl enrichment
 
 Commit message:

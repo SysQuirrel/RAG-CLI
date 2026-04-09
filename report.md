@@ -1,3 +1,16 @@
+## 2026-04-09 16:15:00 IST
+
+Task summary:
+Documented the modular web RAG pipeline with a dedicated README and shared config, enabled streaming chat responses in rag.py so answers appear progressively, and tightened Hugging Face logging so noisy HTTP 503 warnings no longer spam the CLI.
+
+Commit:
+Document web pipeline and stream chat with quieter logs
+
+Add a top-level README that explains how to use the modular web retrieval pipeline (config, crawler, extractor, embedder, retriever, pipeline, modal_pipeline) as a standalone ingestion/query system.
+Introduce a central config.py for the pipeline with an increased EMBEDDING_BATCH_SIZE=128 to reduce embedding latency on large web ingests.
+Update the rag.py chat loop to call the Ollama client in streaming mode and drop the extra corrective regeneration passes, keeping only a lightweight Sources footer for web evidence.
+Quiet Hugging Face hub HTTP logging by setting the huggingface_hub and huggingface_hub.utils._http loggers to ERROR so transient 503 HEAD retries do not clutter interactive chat runs.
+
 ## 2026-04-09 15:45:00 IST
 
 Task summary:

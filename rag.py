@@ -247,15 +247,20 @@ def _configure_quiet_runtime_logs() -> None:
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    for name in (
+    noisy_warn_loggers = (
         "httpx",
         "httpcore",
         "sentence_transformers",
         "transformers",
-        "huggingface_hub",
         "filelock",
-    ):
+    )
+    for name in noisy_warn_loggers:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Hugging Face hub HTTP warnings (e.g. transient 503 HEAD checks) are very noisy in the CLI.
+    # Keep them at ERROR only so they do not spam interactive chat sessions.
+    for name in ("huggingface_hub", "huggingface_hub.utils._http"):
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 _configure_quiet_runtime_logs()
@@ -2315,64 +2320,21 @@ def chat() -> None:
         full_response = ""
         t_gen = time.time()
         try:
+            # Stream the main answer tokens so output appears gradually instead of all at once.
+            console.print("Assistant: ", end="")
             full_response = generate_chat_response(
                 messages,
                 temperature=CFG.ollama_chat_temperature,
                 num_predict=CFG.ollama_chat_num_predict,
                 num_ctx=active_num_ctx,
-                stream=False,
+                stream=True,
             )
 
-            if tool_results and _response_falsely_denies_web_access(full_response):
-                console.print("[yellow]Model ignored tool data; regenerating with stricter grounding...[/yellow]")
-                correction_messages = list(messages) + [
-                    {"role": "assistant", "content": full_response},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous answer incorrectly denied web/tool access. "
-                            "You DO have live tool/API outputs in context. "
-                            "Rewrite the answer using concrete findings from those tool outputs. "
-                            "Do not include any sentence claiming you cannot browse or access real-time info."
-                        ),
-                    },
-                ]
-                full_response = generate_chat_response(
-                    correction_messages,
-                    temperature=CFG.ollama_chat_temperature,
-                    num_predict=CFG.ollama_chat_num_predict,
-                    num_ctx=active_num_ctx,
-                    stream=False,
-                )
-
             evidence_tags = _extract_web_evidence_tags(tool_results)
-            if evidence_tags and not _answer_has_web_citation(full_response):
-                console.print("[yellow]Adding missing web evidence citations...[/yellow]")
-                citation_messages = list(messages) + [
-                    {"role": "assistant", "content": full_response},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Rewrite your previous answer so that web-derived claims include evidence tags "
-                            "exactly from this list: " + "; ".join(evidence_tags) +
-                            "\nKeep the answer concise. Do not invent new tags."
-                        ),
-                    },
-                ]
-                full_response = generate_chat_response(
-                    citation_messages,
-                    temperature=0.0,
-                    num_predict=CFG.ollama_chat_num_predict,
-                    num_ctx=active_num_ctx,
-                    stream=False,
-                )
-
             if evidence_tags:
                 footer = _format_sources_footer(evidence_tags)
                 if footer:
-                    full_response = f"{full_response}\n\n{footer}"
-
-            console.print(f"Assistant: {full_response}")
+                    console.print("\n" + footer)
 
             # [FIX-10] Update sliding window conversation history
             conversation_history.append({"role": "user", "content": _history_text(query)})
