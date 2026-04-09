@@ -155,10 +155,10 @@ class Config:
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
-    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 8192))
+    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))
     ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))
     ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))
-    ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.1))
+    ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))
     ollama_keep_alive: str = "10m"
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))
 
@@ -661,7 +661,7 @@ def retrieve_docs(query: str, q_embed: list, docs_col, top_k: int | None = None)
 
 def retrieve_memory(query: str, embedder, memory_col, q_embed: list | None = None) -> list[dict]:
     if memory_col.count() == 0:
-        return []
+        return []  # Return an empty list if there are no memories
     if q_embed is None:
         q_embed = _to_embedding_list(embedder.encode([query]))
     results = memory_col.query(
@@ -716,7 +716,7 @@ def _is_memory_duplicate(text: str, embedder, memory_col, q_embed: list | None =
 
 def save_memory(user_msg: str, assistant_msg: str, embedder, memory_col) -> None:
     text = _condense_memory_text(user_msg, assistant_msg)
-    emb = _to_embedding_list(embedder.encode([text]))
+    emb = _to_embedding_list(embedder.encode([text]))  # Encode the condensed memory text
     # [FIX-7] skip if near-duplicate already exists
     if _is_memory_duplicate(text, embedder, memory_col, q_embed=emb):
         return
@@ -735,7 +735,7 @@ class OllamaEmbedder:
 
 def load_embedder(silent: bool = False):
     if CFG.use_ollama_embed:
-        if not silent:
+        if not silent:  # Check if silent mode is off
             console.print("[dim]Using nomic-embed-text via Ollama for embeddings.[/dim]")
         return OllamaEmbedder()
     os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
@@ -2100,6 +2100,7 @@ def memory_clear() -> None:
 # ── Chat loop ─────────────────────────────────────────────────────────────────
 
 def chat() -> None:
+    """Interactive CLI loop: route commands, run tools, and stream LLM replies."""
     client = get_chroma()
     docs_col, memory_col = get_collections(client)
     session_recorder = SessionRecorder(max_turns=CFG.session_recorder_max_turns)
@@ -2148,6 +2149,7 @@ def chat() -> None:
     if missing_keys:
         console.print(f"[yellow]Warning: Missing prerequisites: {', '.join(missing_keys)}[/yellow]")
 
+    # Main REPL loop: read user input, interpret commands, then send queries to the model.
     while True:
         try:
             query = Prompt.ask("\n[bold blue]You[/bold blue]").strip()
@@ -2164,13 +2166,14 @@ def chat() -> None:
             conversation_history = []
             continue
 
+        # Parse an optional leading slash command (e.g. /web, /weather) from the input.
         cmd, arg, cleaned_query = _parse_command(query)
 
         if query.strip().startswith("/") and not cmd:
             console.print("Unknown command. Use /help to see all supported commands.")
             continue
 
-        # Short-circuit: capability / help questions
+        # Short-circuit: capability / help questions are answered directly without an LLM call.
         if not cmd and _is_meta_web_capability_question(cleaned_query):
             direct = (
                 "Yes. I can access internet data in this CLI via configured tools when needed. "
@@ -2203,6 +2206,7 @@ def chat() -> None:
         tool_results: dict[str, str] = {}
         web_only_mode = False
 
+        # If the user issued an explicit command, run the corresponding tool(s) first.
         if cmd:
             if cmd != "help" and _is_help_arg(arg):
                 console.print(_command_usage_line(cmd))
@@ -2260,7 +2264,7 @@ def chat() -> None:
                 console.print(f"Session exported: {target}")
                 continue
         else:
-            # Auto-detect tools
+            # Auto-detect tools from natural-language queries when there is no explicit command.
             auto_tools = _auto_detect_tools(cleaned_query)
             for tool_name, tool_arg in auto_tools.items():
                 if tool_name == "web":
@@ -2274,7 +2278,7 @@ def chat() -> None:
                 elif tool_name == "fetch":
                     tool_results["Fetched page"] = tool_fetch_url(tool_arg)
 
-        # [FIX-4] Retrieve: hybrid BM25 + dense
+        # [FIX-4] Retrieve: hybrid BM25 + dense for local docs + semantic memory.
         if web_only_mode:
             doc_chunks = []
             mem_turns = []
@@ -2285,7 +2289,7 @@ def chat() -> None:
                 doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col)
                 mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
 
-        # Auto web fallback if no local docs
+        # Auto web fallback if no strong local docs are found for this turn.
         if (
             CFG.auto_web_fallback_on_empty_docs
             and _any_web_provider_available()
@@ -2300,7 +2304,7 @@ def chat() -> None:
             if compact and not compact.startswith("[Web search]"):
                 tool_results["Web search"] = compact
 
-        # Show sources
+        # Show which local sources, memory turns, and tools contributed to this answer.
         if doc_chunks:
             srcs: list[str] = []
             for chunk in doc_chunks:
@@ -2313,7 +2317,7 @@ def chat() -> None:
         if tool_results:
             console.print(f"[dim]Tools: {list(tool_results.keys())}[/dim]")
 
-        # [FIX-10] Build full messages array with sliding window history
+        # [FIX-10] Build full messages array with sliding window history.
         messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, conversation_history)
         active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
 
@@ -2336,7 +2340,7 @@ def chat() -> None:
                 if footer:
                     console.print("\n" + footer)
 
-            # [FIX-10] Update sliding window conversation history
+            # [FIX-10] Update sliding window conversation history with this turn.
             conversation_history.append({"role": "user", "content": _history_text(query)})
             conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]

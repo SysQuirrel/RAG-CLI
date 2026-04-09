@@ -1,3 +1,14 @@
+## 2026-04-09 16:40:00 IST
+
+Task summary:
+Added a focused docstring and high-level comments to the rag.py chat loop so the flow from user input through command parsing, tool execution, hybrid retrieval, and streamed LLM responses is easier to understand without changing runtime behavior.
+
+Commit:
+Clarify rag chat loop with high-level comments
+
+Explain at the function level that chat() drives the interactive CLI, routes slash commands, runs tools, and streams answers from the model.
+Annotate the main REPL, command parsing, auto-tool detection, retrieval, web-fallback, and history update steps with concise comments to document the control flow while preserving the existing logic.
+
 ## 2026-04-09 16:15:00 IST
 
 Task summary:
