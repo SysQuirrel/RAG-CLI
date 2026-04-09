@@ -38,12 +38,12 @@ class Config:
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", 75))
 
     # ── Embedding ────────────────────────────────────────────────────────────
-    # all-MiniLM-L6-v2 is 80 MB, fast on CPU, 384-dim vectors
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    # Default to bge-base-en-v1.5 for stronger semantic retrieval quality.
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
     EMBEDDING_BATCH_SIZE: int = 128     # chunks embedded per batch (larger batches = fewer forward passes)
 
     # ── Vector store ─────────────────────────────────────────────────────────
-    CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+    CHROMA_DB_PATH: str = os.path.expanduser(os.getenv("CHROMA_DB_PATH", "~/.rag-cli/chroma_new"))
     CHROMA_COLLECTION: str = "rag_documents"
 
     # ── Retrieval ────────────────────────────────────────────────────────────

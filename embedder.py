@@ -4,14 +4,13 @@ embedder.py
 Stage 5 — Embedding
 Stage 6 — Vector Storage
 
-Embeds chunks using a CPU-friendly sentence-transformers model and stores
+Embeds chunks using a sentence-transformers model and stores
 them in ChromaDB for persistent local retrieval.
 
-Model choice — all-MiniLM-L6-v2:
-  - 80 MB on disk, 384-dim vectors
-  - ~14k tokens/sec on an 8-core CPU
-  - Strong benchmark scores for semantic similarity tasks
-  - No GPU required
+Model choice — configured by Config.EMBEDDING_MODEL (default: BAAI/bge-base-en-v1.5):
+    - Better semantic recall than very small embedding models
+    - Works on CPU and GPU (GPU optional)
+    - Requires re-ingestion when changed, because vector spaces are model-specific
 
 ChromaDB choice:
   - Embedded (no server process), stores to disk

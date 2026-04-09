@@ -1,3 +1,14 @@
+## 2026-04-09 22:23:50 IST
+
+Task summary:
+Aligned the entire local stack to BAAI/bge-base-en-v1.5 by updating both rag.py and the modular pipeline defaults, and documented in rag.py how to safely switch embedding models using environment variables and per-model Chroma directories.
+
+Commit:
+Align rag and pipeline embedding defaults and document model-switch workflow
+
+Make rag.py accept EMBEDDING_MODEL as an alias for EMBED_MODEL, keeping bge-base-en-v1.5 as default and preserving CHROMA_DB_PATH override behavior.
+Set pipeline defaults to EMBEDDING_MODEL=BAAI/bge-base-en-v1.5 and CHROMA_DB_PATH=~/.rag-cli/chroma_new, update embedder module docs, and add a model-switching guide in rag.py instructing users to re-ingest after any embedding change.
+
 ## 2026-04-09 21:47:25 IST
 
 Task summary:

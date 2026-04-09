@@ -37,6 +37,12 @@ Improvements over v1 (industry-standard changes):
     [FIX-8]  HTTP: httpx + tenacity exponential backoff on retryable status codes
     [FIX-9]  Prompt injection: XML role-fencing + structural isolation (beyond keyword blocklist)
     [FIX-10] Conversation: sliding-window multi-turn message history passed to model
+
+Embedding model switching guide:
+    1) Set EMBED_MODEL (or EMBEDDING_MODEL) to the SentenceTransformer model id you want.
+    2) Set CHROMA_DB_PATH to a dedicated folder for that model (or let bge use ~/.rag-cli/chroma_new).
+    3) Re-run ingest so vectors are rebuilt for the new embedding space.
+    4) Keep one Chroma folder per embedding model to avoid mixed, incompatible vectors.
 """
 
 import sys
@@ -157,7 +163,7 @@ class Config:
 
     # embedding
     # Embedding defaults are tuned for fast local retrieval quality.
-    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5"))  # Default local embedding model for document vectors.
+    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL") or os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"))  # Default local embedding model for document vectors.
     chroma_db_path: str = field(default_factory=lambda: os.getenv("CHROMA_DB_PATH", "").strip())  # Optional explicit Chroma path override.
     use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))  # Switch to Ollama-hosted embeddings when desired.
     ollama_embed_model: str = "nomic-embed-text:latest"  # Ollama embedding model used when remote embeddings are enabled.
