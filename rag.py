@@ -157,7 +157,8 @@ class Config:
 
     # embedding
     # Embedding defaults are tuned for fast local retrieval quality.
-    embed_model: str = "all-MiniLM-L6-v2"  # Default local embedding model for document vectors.
+    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5"))  # Default local embedding model for document vectors.
+    chroma_db_path: str = field(default_factory=lambda: os.getenv("CHROMA_DB_PATH", "").strip())  # Optional explicit Chroma path override.
     use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))  # Switch to Ollama-hosted embeddings when desired.
     ollama_embed_model: str = "nomic-embed-text:latest"  # Ollama embedding model used when remote embeddings are enabled.
     use_gpu: bool = field(default_factory=_detect_cuda)  # Prefer GPU acceleration when PyTorch can see CUDA.
@@ -247,6 +248,10 @@ class Config:
     @property
     def chroma_dir(self) -> Path:
         """On-disk location for the persistent ChromaDB store."""
+        if self.chroma_db_path:
+            return Path(os.path.expanduser(self.chroma_db_path))
+        if self.embed_model.strip().lower() in {"bge-base-en-v1.5", "baai/bge-base-en-v1.5"}:
+            return self.data_dir / "chroma_new"
         return self.data_dir / "chroma"
 
     @property
@@ -260,6 +265,7 @@ class Config:
 _load_local_env()
 CFG = Config()
 CFG.data_dir.mkdir(parents=True, exist_ok=True)
+CFG.chroma_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _configure_quiet_runtime_logs() -> None:

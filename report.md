@@ -1,3 +1,14 @@
+## 2026-04-09 21:47:25 IST
+
+Task summary:
+Switched rag.py to use BAAI/bge-base-en-v1.5 as the default embedding model, routed this model to a dedicated ~/.rag-cli/chroma_new store, created that folder, and validated ingestion plus a full chat run with phi4-mini while observing runtime resource usage.
+
+Commit:
+Use bge-base-en-v1.5 with dedicated chroma_new store and validate runtime stability
+
+Set EMBED_MODEL default to BAAI/bge-base-en-v1.5, add an optional CHROMA_DB_PATH override, and update Config.chroma_dir so bge uses ~/.rag-cli/chroma_new automatically.
+Ensure CFG.chroma_dir is created on startup, then run ingest and a scripted chat turn to verify end-to-end behavior and collect monitor metrics for CPU and RAM.
+
 ## 2026-04-09 19:12:34 IST
 
 Task summary:
