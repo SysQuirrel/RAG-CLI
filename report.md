@@ -1,3 +1,15 @@
+## 2026-04-09 23:29:52 IST
+
+Task summary:
+Added chat-time auto ingestion for referenced local files and constrained retrieval to those file sources for that turn, so prompts like "what is this pdf about ./simple.pdf" now index and answer from the referenced file instead of drifting to unrelated indexed documents.
+
+Commit:
+Auto-ingest referenced files and constrain turn retrieval by source
+
+Add a shared _ingest_paths helper and use canonical source paths during indexing to keep metadata stable across ingest paths.
+Update chat flow to detect local pdf/txt/md references in natural-language queries, ingest them on demand, rebuild BM25, and pass a source_filter into retrieve_docs.
+Extend retrieve_docs with optional source filtering for both dense and BM25 paths (including filter fallback when vector-store where predicates are unavailable), and fix local file extraction so leading ./ is preserved.
+
 ## 2026-04-09 23:00:12 IST
 
 Task summary:

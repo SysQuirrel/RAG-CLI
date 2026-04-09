@@ -646,7 +646,13 @@ def _reciprocal_rank_fusion(
     return sorted(chunk_map.values(), key=lambda c: c["score"], reverse=True)
 
 
-def retrieve_docs(query: str, q_embed: list, docs_col, top_k: int | None = None) -> list[dict]:
+def retrieve_docs(
+    query: str,
+    q_embed: list,
+    docs_col,
+    top_k: int | None = None,
+    source_filter: set[str] | None = None,
+) -> list[dict]:
     """
     Hybrid retrieval: dense ANN + BM25, fused with RRF, budget-filtered. [FIX-4, FIX-5]
     """
@@ -654,12 +660,24 @@ def retrieve_docs(query: str, q_embed: list, docs_col, top_k: int | None = None)
     if docs_col.count() == 0:
         return []
 
+    active_source_filter = {s for s in (source_filter or set()) if s}
+
     # 1. Dense retrieval
-    results = docs_col.query(
-        query_embeddings=q_embed,
-        n_results=min(top_k * 2, docs_col.count()),
-        include=["documents", "metadatas", "distances"],
-    )
+    n_results = min(top_k * 2, docs_col.count())
+    query_kwargs: dict[str, Any] = {
+        "query_embeddings": q_embed,
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if active_source_filter:
+        query_kwargs["where"] = {"source": {"$in": sorted(active_source_filter)}}
+    try:
+        results = docs_col.query(**query_kwargs)
+    except Exception:
+        # Fallback for vector stores that do not support $in filters.
+        query_kwargs.pop("where", None)
+        query_kwargs["n_results"] = docs_col.count()
+        results = docs_col.query(**query_kwargs)
     documents = _normalize_chroma_rows(results.get("documents"))
     metadatas = _normalize_chroma_rows(results.get("metadatas"))
     distances = _normalize_chroma_rows(results.get("distances"))
@@ -674,10 +692,21 @@ def retrieve_docs(query: str, q_embed: list, docs_col, top_k: int | None = None)
         if CFG.drop_suspicious_chunks and looks_like_prompt_injection(doc):
             continue
         source = meta.get("source", "?") if isinstance(meta, dict) else "?"
+        source = _canonicalize_source(source)
+        if active_source_filter and source not in active_source_filter:
+            continue
         dense_chunks.append({"text": sanitize_context_text(doc), "source": source, "score": score})
 
     # 2. BM25 sparse retrieval
-    bm25_results = _BM25_INDEX.query(query, top_k=top_k * 2)
+    bm25_results = _BM25_INDEX.query(query, top_k=top_k * 4)
+    if active_source_filter and bm25_results:
+        filtered_bm25: list[tuple[int, float]] = []
+        for corpus_idx, bm25_score in bm25_results:
+            meta = _BM25_INDEX._corpus_metas[corpus_idx] if corpus_idx < len(_BM25_INDEX._corpus_metas) else {}
+            source = meta.get("source", "?") if isinstance(meta, dict) else "?"
+            if _canonicalize_source(source) in active_source_filter:
+                filtered_bm25.append((corpus_idx, bm25_score))
+        bm25_results = filtered_bm25
 
     # 3. Fuse
     fused = _reciprocal_rank_fusion(
@@ -827,7 +856,6 @@ def _score_and_trim_web_results(raw: str, query: str) -> str:
     """
     if not raw or not raw.strip():
         return raw
-
     # Parse provider sections
     section_re = re.compile(r"===\s*([^\n=]+?)\s*===\n(.*?)(?=\n===|\Z)", re.S)
     snippet_re = re.compile(
@@ -1018,7 +1046,7 @@ def _extract_local_file_refs(text: str) -> list[Path]:
     seen: set[str] = set()
 
     for raw in pattern.findall(text or ""):
-        cleaned = raw.strip().strip(".,;:!?)]}'\"")
+        cleaned = raw.strip().rstrip(".,;:!?)]}'\"")
         if not cleaned or "://" in cleaned:
             continue
         candidate = Path(cleaned).expanduser()
@@ -1035,6 +1063,34 @@ def _extract_local_file_refs(text: str) -> list[Path]:
         refs.append(candidate)
 
     return refs
+
+
+def _ingest_paths(files: list[Path], embedder, docs_col, show_status: bool = True) -> int:
+    """Index specific files and return number of chunks upserted."""
+    total_chunks = 0
+    for fp in files:
+        source_path = _canonicalize_source(str(fp))
+        if show_status:
+            console.print(f"[cyan]Ingesting:[/cyan] {Path(source_path).name}", end=" ")
+        try:
+            text = read_file(fp)
+            chunks = chunk_text(text, source_path)
+            if not chunks:
+                if show_status:
+                    console.print("[yellow](empty)[/yellow]")
+                continue
+            texts = [c["text"] for c in chunks]
+            ids = [c["id"] for c in chunks]
+            metas = [{"source": c["source"], "idx": c["idx"]} for c in chunks]
+            embeds = _to_embedding_list(embedder.encode(texts, show_progress_bar=False))
+            docs_col.upsert(ids=ids, embeddings=embeds, documents=texts, metadatas=cast(Any, metas))
+            if show_status:
+                console.print(f"[green]✓ {len(chunks)} chunks[/green]")
+            total_chunks += len(chunks)
+        except Exception as e:
+            if show_status:
+                console.print(f"[red]✗ error: {e}[/red]")
+    return total_chunks
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -1068,25 +1124,8 @@ def ingest(paths: list[str]) -> None:
         console.print("[red]No files found to ingest.[/red]")
         return
 
-    total_chunks = 0
-    for fp in files:
-        console.print(f"[cyan]Ingesting:[/cyan] {fp.name}", end=" ")
-        try:
-            text = read_file(fp)
-            chunks = chunk_text(text, str(fp))
-            if not chunks:
-                console.print("[yellow](empty)[/yellow]")
-                continue
-            texts = [c["text"] for c in chunks]
-            ids = [c["id"] for c in chunks]          # [FIX-3] SHA-256 IDs
-            metas = [{"source": c["source"], "idx": c["idx"]} for c in chunks]
-            with console.status("embedding...", spinner="dots"):
-                embeds = _to_embedding_list(embedder.encode(texts, show_progress_bar=False))
-            docs_col.upsert(ids=ids, embeddings=embeds, documents=texts, metadatas=cast(Any, metas))
-            console.print(f"[green]✓ {len(chunks)} chunks[/green]")
-            total_chunks += len(chunks)
-        except Exception as e:
-            console.print(f"[red]✗ error: {e}[/red]")
+    with console.status("embedding...", spinner="dots"):
+        total_chunks = _ingest_paths(files, embedder, docs_col, show_status=True)
 
     # [FIX-4] Rebuild BM25 index after ingestion
     rebuild_bm25_index(docs_col)
@@ -2354,6 +2393,16 @@ def chat() -> None:
                 elif tool_name == "fetch":
                     tool_results["Fetched page"] = tool_fetch_url(tool_arg)
 
+        # Auto-index referenced local files and constrain this turn's retrieval to them.
+        referenced_files = _extract_local_file_refs(cleaned_query)
+        source_filter: set[str] = set()
+        if referenced_files:
+            source_filter = {_canonicalize_source(str(path)) for path in referenced_files}
+            with console.status("[dim]Indexing referenced local file(s)...[/dim]", spinner="dots"):
+                embedder = get_embedder()
+                _ingest_paths(referenced_files, embedder, docs_col, show_status=False)
+                rebuild_bm25_index(docs_col)
+
         # [FIX-4] Retrieve: hybrid BM25 + dense for local docs + semantic memory.
         if web_only_mode:
             doc_chunks = []
@@ -2362,7 +2411,7 @@ def chat() -> None:
             with console.status("[dim]Retrieving context...[/dim]", spinner="dots"):
                 embedder = get_embedder()
                 q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
-                doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col)
+                doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col, source_filter=source_filter)
                 mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
 
         # Auto web fallback if no strong local docs are found for this turn.
