@@ -1,3 +1,14 @@
+## 2026-04-09 15:20:32 IST
+
+Task summary:
+Restored the original Chroma storage default to ~/.rag-cli/chroma and removed the special greeting shortcut so every chat response again flows through the LLM.
+
+Commit:
+Restore original Chroma path and keep greeting responses LLM-generated
+
+Revert the project-local chroma_db default and return to the ~/.rag-cli/chroma storage location.
+Remove the tiny-greeting shortcut so short messages are still handled by the model rather than a hardcoded Python response.
+
 ## 2026-04-09 15:17:00 IST
 
 Task summary:

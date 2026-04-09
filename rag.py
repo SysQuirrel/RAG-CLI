@@ -228,10 +228,7 @@ class Config:
 
     @property
     def chroma_dir(self) -> Path:
-        override = os.getenv("CHROMA_DB_PATH", "").strip()
-        if override:
-            return Path(override).expanduser()
-        return Path(__file__).resolve().parent / "chroma_db"
+        return self.data_dir / "chroma"
 
     @property
     def session_export_dir(self) -> Path:
@@ -765,20 +762,6 @@ def get_embedder(silent: bool = False):
             if _EMBEDDER_INSTANCE is None:
                 _EMBEDDER_INSTANCE = load_embedder(silent=silent)
     return _EMBEDDER_INSTANCE
-
-
-def _is_tiny_chitchat(query: str) -> bool:
-    """Fast path for tiny greetings to avoid expensive retrieval on trivial turns."""
-    q = re.sub(r"[^a-z0-9\s]", "", query.lower()).strip()
-    if not q:
-        return False
-    if len(q.split()) > 3:
-        return False
-    return q in {
-        "hi", "hello", "hey", "yo", "sup", "hola",
-        "good morning", "good evening", "good afternoon",
-        "hii", "heyy", "hy",
-    }
 
 
 def _to_embedding_list(embeddings: Any) -> list:
@@ -2214,35 +2197,6 @@ def chat() -> None:
         # Tool execution
         tool_results: dict[str, str] = {}
         web_only_mode = False
-
-        # Fast trivial-turn path: skip retrieval/memory/tool overhead for greetings.
-        if not cmd and _is_tiny_chitchat(cleaned_query):
-            fast_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a concise assistant. Reply briefly and naturally to greetings. "
-                        "Do not add unrelated context."
-                    ),
-                },
-                {"role": "user", "content": cleaned_query},
-            ]
-            t_gen = time.time()
-            full_response = generate_chat_response(
-                fast_messages,
-                temperature=0.2,
-                num_predict=64,
-                num_ctx=1024,
-                stream=False,
-            )
-            console.print(f"Assistant: {full_response}")
-            session_recorder.add_turn(query, full_response, tools=[], gen_time_sec=time.time() - t_gen)
-            conversation_history.append({"role": "user", "content": _history_text(query)})
-            conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
-            conversation_history = conversation_history[-(CFG.conversation_window * 2):]
-            turn_count += 1
-            maybe_release_ram(turn_count)
-            continue
 
         if cmd:
             if cmd != "help" and _is_help_arg(arg):
