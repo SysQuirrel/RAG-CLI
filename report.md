@@ -1,3 +1,14 @@
+## 2026-04-09 15:45:00 IST
+
+Task summary:
+Removed legacy CLI scripts and an experimental standalone web_search helper so the active RAG CLI and modular web pipeline live in a smaller, clearer set of modules, and updated the README project structure to match the merged crawler/extractor layout.
+
+Commit:
+Remove legacy CLI entrypoints and standalone web_search script
+
+Delete the unused main.py scaffold, the older modified_rag.py CLI, and the separate web_search.py experiment now that web search lives in crawler.py and the multi-stage web pipeline is wired through pipeline.py and rag.py.
+Refresh the README tree so it points to crawler.py for web search + crawl and extractor.py for extraction + chunking, reflecting the current code organization.
+
 ## 2026-04-09 15:35:00 IST
 
 Task summary:
