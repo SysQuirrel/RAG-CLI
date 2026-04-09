@@ -24,6 +24,7 @@ import re
 import hashlib
 from pathlib import Path
 from datetime import datetime
+from typing import Any, cast
 
 import requests
 import chromadb
@@ -136,12 +137,17 @@ def ingest(paths: list[str]):
                 continue
             texts  = [c["text"] for c in chunks]
             ids    = [chunk_id(c["source"], c["idx"]) for c in chunks]
-            metas  = [{"source": c["source"], "idx": c["idx"]} for c in chunks]
+            metas: list[dict[str, Any]] = [{"source": c["source"], "idx": c["idx"]} for c in chunks]
             with console.status("embedding...", spinner="dots"):
                 embeds = embedder.encode(texts, show_progress_bar=False)
                 if not isinstance(embeds, list):
                     embeds = embeds.tolist()
-            docs_col.upsert(ids=ids, embeddings=embeds, documents=texts, metadatas=metas)
+            docs_col.upsert(
+                ids=ids,
+                embeddings=embeds,
+                documents=texts,
+                metadatas=cast(Any, metas),
+            )
             console.print(f"[green]{len(chunks)} chunks[/green]")
             total += len(chunks)
         except Exception as e:
@@ -555,9 +561,19 @@ def memory_list():
     table   = Table(title=f"Memory ({count} turns)", show_lines=True)
     table.add_column("Time", style="dim", width=20)
     table.add_column("Content")
-    paired  = sorted(zip(results["documents"], results["metadatas"]), key=lambda x: x[1].get("ts", ""))
+    documents = results.get("documents") or []
+    metadatas = results.get("metadatas") or []
+    paired = sorted(
+        zip(documents, metadatas),
+        key=lambda x: str((x[1] or {}).get("ts", "")),
+    )
     for doc, meta in paired[-20:]:
-        table.add_row(meta.get("ts", "?")[:19], doc[:180] + ("…" if len(doc) > 180 else ""))
+        meta_map = meta or {}
+        doc_text = str(doc)
+        table.add_row(
+            str(meta_map.get("ts", "?"))[:19],
+            doc_text[:180] + ("…" if len(doc_text) > 180 else ""),
+        )
     console.print(table)
 
 def memory_clear():
@@ -573,8 +589,8 @@ def docs_list():
         return
     results = docs_col.get(include=["metadatas"], limit=1000)
     sources: dict[str, int] = {}
-    for meta in results["metadatas"]:
-        src = Path(meta.get("source", "?")).name
+    for meta in (results.get("metadatas") or []):
+        src = Path(str((meta or {}).get("source", "?"))).name
         sources[src] = sources.get(src, 0) + 1
     table = Table(title=f"Indexed documents ({count} chunks)")
     table.add_column("File", style="cyan")
