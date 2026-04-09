@@ -40,6 +40,7 @@ from typing import Optional
 
 import trafilatura
 from bs4 import BeautifulSoup
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import Config
 from crawler import RawPage
@@ -253,3 +254,118 @@ def extract_all(pages: list[RawPage]) -> list[dict]:
         len(documents), skipped
     )
     return documents
+
+
+# ── Stage 4 — Chunking & Preprocessing (merged from chunker.py) ─────────────
+
+
+def _find_nearest_heading(text_before: str, headings: list[str]) -> str:
+    """Find the last heading that appears before the chunk in the document."""
+    if not headings:
+        return ""
+    for heading in reversed(headings):
+        heading_text = re.sub(r"^H\d+:\s*", "", heading)
+        if heading_text.lower() in text_before.lower():
+            return heading_text
+    return headings[0].replace("H1: ", "").replace("H2: ", "").replace("H3: ", "")
+
+
+def _chunk_hash(text: str) -> str:
+    """Short hash of chunk text for deduplication."""
+    return hashlib.md5(text.strip().encode()).hexdigest()[:12]
+
+
+def chunk_document(doc: dict) -> list[dict]:
+    """Split a single document into overlapping chunks ready for embedding."""
+    content: str = doc.get("content", "")
+    if not content.strip():
+        logger.debug("Empty content for doc %s, skipping", doc["id"])
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=Config.CHUNK_SIZE,
+        chunk_overlap=Config.CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""],
+        length_function=len,
+        is_separator_regex=False,
+    )
+    raw_chunks: list[str] = splitter.split_text(content)
+    if not raw_chunks:
+        return []
+
+    headings = doc.get("headings", [])
+    seen_hashes: set[str] = set()
+    chunks: list[dict] = []
+
+    for idx, chunk_text in enumerate(raw_chunks):
+        if len(chunk_text.split()) < 20:
+            logger.debug(
+                "Skipping short chunk (%d words) from %s",
+                len(chunk_text.split()),
+                doc["url"],
+            )
+            continue
+
+        h = _chunk_hash(chunk_text)
+        if h in seen_hashes:
+            logger.debug("Duplicate chunk skipped in %s", doc["url"])
+            continue
+        seen_hashes.add(h)
+
+        chunk_start = content.find(chunk_text[:50])
+        text_before = content[: max(chunk_start, 0)]
+        nearest_heading = _find_nearest_heading(text_before, headings)
+
+        chunk = {
+            "chunk_id": f"{doc['id']}_{idx:04d}",
+            "doc_id": doc["id"],
+            "url": doc["url"],
+            "domain": doc.get("domain", ""),
+            "title": doc.get("title", ""),
+            "nearest_heading": nearest_heading,
+            "text": chunk_text.strip(),
+            "chunk_index": idx,
+            "total_chunks": len(raw_chunks),
+            "metadata": {
+                "crawled_at": doc.get("metadata", {}).get("crawled_at", ""),
+                "language": doc.get("metadata", {}).get("language", "en"),
+                "word_count": len(chunk_text.split()),
+            },
+        }
+        chunks.append(chunk)
+
+    total = len(chunks)
+    for chunk in chunks:
+        chunk["total_chunks"] = total
+
+    logger.debug(
+        "Chunked '%s' → %d chunks (from %d raw splits)",
+        doc["title"],
+        total,
+        len(raw_chunks),
+    )
+    return chunks
+
+
+def chunk_all(documents: list[dict]) -> list[dict]:
+    """Chunk all documents and globally deduplicate across the corpus."""
+    all_chunks: list[dict] = []
+    global_seen: set[str] = set()
+
+    for doc in documents:
+        doc_chunks = chunk_document(doc)
+        for chunk in doc_chunks:
+            h = _chunk_hash(chunk["text"])
+            if h in global_seen:
+                logger.debug("Cross-doc duplicate chunk skipped: %s", chunk["url"])
+                continue
+            global_seen.add(h)
+            all_chunks.append(chunk)
+
+    logger.info(
+        "Chunking complete: %d total chunks from %d documents",
+        len(all_chunks),
+        len(documents),
+    )
+    return all_chunks
+

@@ -4,11 +4,16 @@ version = "0.1.0"
 description = "Terminal RAG assistant with Chroma memory and combined Tavily/Jina/Firecrawl web grounding"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4>=4.14.3",
     "chromadb>=1.5.5",
     "ddgs>=9.6.1",
+    "langchain-text-splitters>=1.1.1",
+    "modal>=1.4.1",
     "ollama>=0.6.1",
     "pypdf>=6.9.2",
+    "rank-bm25>=0.2.2",
     "rich>=14.3.3",
     "sentence-transformers>=5.3.0",
     "tavily-python>=0.7.23",
+    "trafilatura>=2.0.0",
 ]

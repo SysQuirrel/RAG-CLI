@@ -1,3 +1,14 @@
+## 2026-04-09 15:35:00 IST
+
+Task summary:
+Merged the modular web search stage into crawler.py and the chunking stage into extractor.py so the web ingestion pipeline code lives in fewer, better-organized modules without changing runtime behavior, and updated pipeline.py and modal_pipeline.py to import from the new locations.
+
+Commit:
+Merge web search and chunking stages into crawler and extractor
+
+Move SearchResult and search_web from the standalone search.py into crawler.py so crawling and initial web search live together.
+Move chunk_document and chunk_all from chunker.py into extractor.py to colocate content extraction and chunking, updating pipeline and Modal entrypoints accordingly and removing the now-redundant search.py and chunker.py files.
+
 ## 2026-04-09 15:20:32 IST
 
 Task summary:

@@ -276,3 +276,100 @@ def crawl(
         len(results), len(visited)
     )
     return results
+
+
+# ── Stage 1a — Web Search (merged from search.py) ───────────────────────────
+
+
+@dataclass
+class SearchResult:
+    """Structured container for a single search result."""
+    url: str
+    title: str
+    snippet: str
+    # Tavily optionally returns pre-fetched content — use it if present
+    # to skip a redundant HTTP request for that page.
+    raw_content: Optional[str] = field(default=None, repr=False)
+
+
+def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
+    """Call Tavily's /search endpoint."""
+    if not Config.TAVILY_API_KEY:
+        raise EnvironmentError("TAVILY_API_KEY not set")
+
+    payload = {
+        "api_key": Config.TAVILY_API_KEY,
+        "query": query,
+        "max_results": max_results,
+        "include_raw_content": True,
+        "search_depth": "advanced",
+    }
+
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        json=payload,
+        timeout=Config.REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results: list[SearchResult] = []
+    for item in data.get("results", []):
+        results.append(SearchResult(
+            url=item.get("url", ""),
+            title=item.get("title", ""),
+            snippet=item.get("content", ""),
+            raw_content=item.get("raw_content"),
+        ))
+    return results
+
+
+def _search_langsearch(query: str, max_results: int) -> list[SearchResult]:
+    """LangSearch API — returns URLs + snippets without raw page content."""
+    if not Config.LANGSEARCH_API_KEY:
+        raise EnvironmentError("LANGSEARCH_API_KEY not set")
+
+    headers = {"Authorization": f"Bearer {Config.LANGSEARCH_API_KEY}"}
+    params = {"q": query, "num": max_results}
+
+    resp = requests.get(
+        "https://api.langsearch.com/v1/search",
+        headers=headers,
+        params=params,
+        timeout=Config.REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results: list[SearchResult] = []
+    for item in data.get("data", {}).get("webPages", {}).get("value", []):
+        results.append(SearchResult(
+            url=item.get("url", ""),
+            title=item.get("name", ""),
+            snippet=item.get("snippet", ""),
+        ))
+    return results
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+def search_web(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Entry point for web search (Tavily → LangSearch fallback)."""
+    logger.info("Searching web for: %r (max %d results)", query, max_results)
+
+    if Config.TAVILY_API_KEY:
+        try:
+            results = _search_tavily(query, max_results)
+            logger.info("Tavily returned %d results", len(results))
+            return results
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Tavily failed (%s), trying LangSearch…", exc)
+
+    if Config.LANGSEARCH_API_KEY:
+        results = _search_langsearch(query, max_results)
+        logger.info("LangSearch returned %d results", len(results))
+        return results
+
+    raise EnvironmentError(
+        "No search API key configured. "
+        "Set TAVILY_API_KEY or LANGSEARCH_API_KEY in your .env file."
+    )
