@@ -1096,40 +1096,108 @@ def _ingest_paths(files: list[Path], embedder, docs_col, show_status: bool = Tru
 # ── Ingest ────────────────────────────────────────────────────────────────────
 
 SKIP_INGEST_FILENAMES = {"memory_1.md", "memory_2.md"}
+SUPPORTED_INGEST_EXTENSIONS = {".pdf", ".txt", ".md"}
+
+
+def _normalize_input_path_arg(raw_path: str) -> str:
+    """Normalize path args and tolerate accidental quote wrapping."""
+    text = (raw_path or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"\"", "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
+def _collect_ingest_targets(paths: list[str]) -> tuple[list[Path], list[str], list[str], int]:
+    """Resolve user-supplied ingest targets into a deduplicated file list."""
+    files: list[Path] = []
+    missing_paths: list[str] = []
+    unsupported_paths: list[str] = []
+    skipped_memory_count = 0
+    seen: set[str] = set()
+
+    for raw in paths:
+        normalized = _normalize_input_path_arg(raw)
+        if not normalized:
+            missing_paths.append(raw)
+            continue
+
+        fp = Path(normalized).expanduser()
+        if fp.is_dir():
+            for ext in SUPPORTED_INGEST_EXTENSIONS:
+                for candidate in fp.rglob(f"*{ext}"):
+                    if candidate.name in SKIP_INGEST_FILENAMES:
+                        skipped_memory_count += 1
+                        continue
+                    resolved = candidate.resolve()
+                    key = str(resolved)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    files.append(resolved)
+            continue
+
+        if fp.is_file():
+            if fp.name in SKIP_INGEST_FILENAMES:
+                skipped_memory_count += 1
+                continue
+            if fp.suffix.lower() not in SUPPORTED_INGEST_EXTENSIONS:
+                unsupported_paths.append(normalized)
+                continue
+            resolved = fp.resolve()
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(resolved)
+            continue
+
+        missing_paths.append(normalized)
+
+    return files, missing_paths, unsupported_paths, skipped_memory_count
 
 
 def ingest(paths: list[str]) -> None:
     embedder = get_embedder()
     client = get_chroma()
     docs_col, _ = get_collections(client)
+    ingest_started = time.perf_counter()
 
-    files: list[Path] = []
-    for p in paths:
-        fp = Path(p)
-        if fp.is_dir():
-            for ext in ("*.pdf", "*.txt", "*.md"):
-                files.extend(
-                    c for c in fp.rglob(ext)
-                    if c.name not in SKIP_INGEST_FILENAMES
-                )
-        elif fp.is_file():
-            if fp.name in SKIP_INGEST_FILENAMES:
-                console.print(f"[yellow]Skipping local memory file: {p}[/yellow]")
-                continue
-            files.append(fp)
-        else:
-            console.print(f"[yellow]Skipping (not found): {p}[/yellow]")
+    files, missing_paths, unsupported_paths, skipped_memory_count = _collect_ingest_targets(paths)
+
+    for missing in missing_paths:
+        console.print(f"[red]Validation error:[/red] path not found: {missing}")
+
+    for unsupported in unsupported_paths:
+        allowed = ", ".join(sorted(SUPPORTED_INGEST_EXTENSIONS))
+        console.print(f"[red]Validation error:[/red] unsupported extension: {unsupported} (allowed: {allowed})")
 
     if not files:
-        console.print("[red]No files found to ingest.[/red]")
+        console.print("[red]No valid files found to ingest.[/red]")
         return
 
+    docs_before = docs_col.count()
     with console.status("embedding...", spinner="dots"):
         total_chunks = _ingest_paths(files, embedder, docs_col, show_status=True)
 
     # [FIX-4] Rebuild BM25 index after ingestion
     rebuild_bm25_index(docs_col)
-    console.print(f"\n[bold green]Done. Total chunks indexed: {total_chunks}[/bold green]")
+
+    docs_after = docs_col.count()
+    unique_chunks_added = max(0, docs_after - docs_before)
+    duplicate_or_updated = max(0, total_chunks - unique_chunks_added)
+    elapsed_sec = time.perf_counter() - ingest_started
+
+    console.print(f"\n[bold green]Done. Total chunks processed: {total_chunks}[/bold green]")
+    console.print(
+        "[dim]Ingest summary:[/dim] "
+        f"accepted_files={len(files)} | "
+        f"missing_paths={len(missing_paths)} | "
+        f"unsupported_paths={len(unsupported_paths)} | "
+        f"skipped_memory_files={skipped_memory_count} | "
+        f"unique_chunks_added={unique_chunks_added} | "
+        f"duplicate_or_updated={duplicate_or_updated} | "
+        f"elapsed={elapsed_sec:.2f}s"
+    )
 
 
 # ── Resource monitor (unchanged logic, uses CFG) ─────────────────────────────

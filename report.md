@@ -1,3 +1,15 @@
+## 2026-04-09 23:37:49 IST
+
+Task summary:
+Implemented stronger ingest input handling for files/directories with quoted-path tolerance, explicit validation errors for missing and unsupported paths, and a structured ingest summary that reports accepted files, skipped items, chunk totals, dedup/update counts, and elapsed time.
+
+Commit:
+Harden ingest validation and add summary metrics
+
+Add SUPPORTED_INGEST_EXTENSIONS, input-path normalization, and a dedicated target collector that resolves files/directories into deduplicated ingest targets.
+Emit validation errors for missing paths and unsupported extensions while continuing with valid targets.
+Track and print ingest metrics including accepted files, skipped memory files, unique chunks added, duplicate-or-updated chunks, and elapsed runtime.
+
 ## 2026-04-09 23:29:52 IST
 
 Task summary:
