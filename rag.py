@@ -997,6 +997,46 @@ def read_file(path: Path) -> str:
     return path.read_text(errors="replace")
 
 
+def _canonicalize_source(source: str) -> str:
+    """Normalize local file sources so path-based queries match stored chunks."""
+    text = str(source).strip()
+    if not text or "://" in text:
+        return text
+    try:
+        path = Path(text).expanduser()
+        if path.exists():
+            return str(path.resolve())
+    except Exception:
+        pass
+    return text
+
+
+def _extract_local_file_refs(text: str) -> list[Path]:
+    """Extract supported local file references from a natural-language query."""
+    pattern = re.compile(r"(?<!\w)(?:\.\./|\./|/)?[^\s<>'\"`]+?\.(?:pdf|txt|md)(?!\w)", re.I)
+    refs: list[Path] = []
+    seen: set[str] = set()
+
+    for raw in pattern.findall(text or ""):
+        cleaned = raw.strip().strip(".,;:!?)]}'\"")
+        if not cleaned or "://" in cleaned:
+            continue
+        candidate = Path(cleaned).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        key = str(candidate)
+        if candidate.suffix.lower() not in {".pdf", ".txt", ".md"}:
+            continue
+        if key in seen or not candidate.exists():
+            continue
+        seen.add(key)
+        refs.append(candidate)
+
+    return refs
+
+
 # ── Ingest ────────────────────────────────────────────────────────────────────
 
 SKIP_INGEST_FILENAMES = {"memory_1.md", "memory_2.md"}
@@ -1818,7 +1858,9 @@ def _is_meta_web_capability_question(query: str) -> bool:
 def _is_command_help_question(query: str) -> bool:
     q = query.lower().strip()
     has_marker = any(m in q for m in ["what does", "what is", "how to use", "how do i use", "usage", "help with", "explain"])
-    has_cmd = bool(re.search(r"/[a-zA-Z]+", q))
+    # Treat only known CLI commands as commands; ignore filesystem paths like ./file.pdf.
+    mentioned = re.findall(r"(?<!\.)/([a-zA-Z][a-zA-Z0-9_-]*)\b", q)
+    has_cmd = any(f"/{name}" in COMMAND_USAGE for name in mentioned)
     return (has_marker and has_cmd) or "list commands" in q or "available commands" in q
 
 

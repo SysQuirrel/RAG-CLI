@@ -1,3 +1,14 @@
+## 2026-04-09 23:00:12 IST
+
+Task summary:
+Fixed a false command-help trigger in rag.py so questions that include local PDF paths (for example `./simple.pdf`) are treated as normal RAG queries instead of command-usage questions.
+
+Commit:
+Ignore filesystem paths in command-help detection
+
+Refine command-help intent detection to only recognize known slash commands from COMMAND_USAGE.
+Avoid matching path-like text such as ./simple.pdf by excluding dot-prefixed slash segments and validating extracted tokens against supported CLI commands.
+
 ## 2026-04-09 22:23:50 IST
 
 Task summary:
