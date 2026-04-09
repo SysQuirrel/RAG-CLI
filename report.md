@@ -1,3 +1,15 @@
+## 2026-04-09 23:46:36 IST
+
+Task summary:
+Implemented policy-first routing so local file references force local-only retrieval on that turn, preventing accidental web ingestion/search for prompts that include local paths like ./simple.pdf.
+
+Commit:
+Enforce local-first routing for file-referenced queries
+
+Add deterministic guard in _should_web_search to return false when local file references are present.
+Update _auto_detect_tools to accept allow_web and block automatic web routing on local-only turns.
+Detect local references before tool auto-detection in chat(), log local-only routing, and block auto web fallback when a source filter is active.
+
 ## 2026-04-09 23:37:49 IST
 
 Task summary:

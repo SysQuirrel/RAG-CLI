@@ -1897,9 +1897,9 @@ def _parse_command(query: str) -> tuple[str | None, str, str]:
     return cmd, arg, arg
 
 
-def _auto_detect_tools(query: str) -> dict[str, str]:
+def _auto_detect_tools(query: str, allow_web: bool = True) -> dict[str, str]:
     triggered: dict[str, str] = {}
-    if _any_web_provider_available() and _should_web_search(query):
+    if allow_web and _any_web_provider_available() and _should_web_search(query):
         triggered["web"] = query
     hit, loc = _should_weather(query)
     if hit and CFG.openweather_api_key and loc:
@@ -1972,6 +1972,9 @@ def _is_command_help_question(query: str) -> bool:
 
 
 def _should_web_search(query: str) -> bool:
+    # Deterministic local-first guard: if a local file is referenced, do not auto-route to web.
+    if _extract_local_file_refs(query):
+        return False
     if _is_meta_web_capability_question(query) or _is_command_help_question(query):
         return False
     triggers = [
@@ -2385,6 +2388,11 @@ def chat() -> None:
             maybe_release_ram(turn_count)
             continue
 
+        # Detect local file references once and use them to enforce local-first routing.
+        referenced_files = _extract_local_file_refs(cleaned_query)
+        source_filter: set[str] = {_canonicalize_source(str(path)) for path in referenced_files}
+        local_only_turn = bool(source_filter)
+
         # Tool execution
         tool_results: dict[str, str] = {}
         web_only_mode = False
@@ -2448,7 +2456,7 @@ def chat() -> None:
                 continue
         else:
             # Auto-detect tools from natural-language queries when there is no explicit command.
-            auto_tools = _auto_detect_tools(cleaned_query)
+            auto_tools = _auto_detect_tools(cleaned_query, allow_web=not local_only_turn)
             for tool_name, tool_arg in auto_tools.items():
                 if tool_name == "web":
                     tool_results["Web search"] = _run_web_lookup(tool_arg, interactive=False)
@@ -2462,10 +2470,8 @@ def chat() -> None:
                     tool_results["Fetched page"] = tool_fetch_url(tool_arg)
 
         # Auto-index referenced local files and constrain this turn's retrieval to them.
-        referenced_files = _extract_local_file_refs(cleaned_query)
-        source_filter: set[str] = set()
         if referenced_files:
-            source_filter = {_canonicalize_source(str(path)) for path in referenced_files}
+            console.print("[dim]Routing: local-file reference detected -> local-only retrieval for this turn.[/dim]")
             with console.status("[dim]Indexing referenced local file(s)...[/dim]", spinner="dots"):
                 embedder = get_embedder()
                 _ingest_paths(referenced_files, embedder, docs_col, show_status=False)
@@ -2487,6 +2493,7 @@ def chat() -> None:
             CFG.auto_web_fallback_on_empty_docs
             and _any_web_provider_available()
             and not cmd
+            and not local_only_turn
             and "Web search" not in tool_results
             and _should_web_search(cleaned_query)
             and len(cleaned_query.split()) >= max(1, CFG.auto_web_min_query_words)
