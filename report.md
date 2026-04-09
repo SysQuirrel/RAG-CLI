@@ -1,3 +1,14 @@
+## 2026-04-09 19:12:34 IST
+
+Task summary:
+Expanded the rag.py Config block with inline comments on nearly every customizable field from line 154 through 245 so the effect of each setting on model behavior, retrieval, web fallback, and memory handling is explicit.
+
+Commit:
+Annotate every configurable rag.py setting with its purpose
+
+Add concise inline comments to the data, embedding, generation, retrieval, memory, monitoring, web, conversation, and API key settings so each knob explains the experience tradeoff it controls.
+Keep the update strictly comment-only and verify rag.py still parses cleanly after the edit.
+
 ## 2026-04-09 19:08:01 IST
 
 Task summary:

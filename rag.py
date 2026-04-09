@@ -153,96 +153,96 @@ class Config:
     """All settings, read from env exactly once at startup. [FIX-1]"""
     # paths
     # Root directory for local persistent state (index, exports, cache metadata).
-    data_dir: Path = field(default_factory=lambda: Path.home() / ".rag-cli")
+    data_dir: Path = field(default_factory=lambda: Path.home() / ".rag-cli")  # Base directory for all local RAG state.
 
     # embedding
     # Embedding defaults are tuned for fast local retrieval quality.
-    embed_model: str = "all-MiniLM-L6-v2"
-    use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))
-    ollama_embed_model: str = "nomic-embed-text:latest"
-    use_gpu: bool = field(default_factory=_detect_cuda)
+    embed_model: str = "all-MiniLM-L6-v2"  # Default local embedding model for document vectors.
+    use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))  # Switch to Ollama-hosted embeddings when desired.
+    ollama_embed_model: str = "nomic-embed-text:latest"  # Ollama embedding model used when remote embeddings are enabled.
+    use_gpu: bool = field(default_factory=_detect_cuda)  # Prefer GPU acceleration when PyTorch can see CUDA.
 
     # ollama / generation
     # Controls model choice, latency, and output style for chat answers.
-    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))
-    ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))  # Primary chat model used for responses.
+    ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))  # Ollama server URL used for generation and embedding.
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
-    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))
-    ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))
-    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))
-    ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))
-    ollama_keep_alive: str = "10m"
-    ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))
+    ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))  # Context window for normal chat turns.
+    ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))  # Smaller context budget for web-augmented turns.
+    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))  # Max tokens to generate per reply.
+    ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))  # Randomness level for answer style.
+    ollama_keep_alive: str = "10m"  # Keep the model warm between turns to reduce reload latency.
+    ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))  # CPU threads reserved for Ollama inference.
 
     # retrieval
     # Retrieval thresholds govern recall/precision tradeoffs and chunk granularity.
-    top_k_docs: int = field(default_factory=lambda: _env_int("TOP_K_DOCS", 5))          # [FIX-5] more candidates for budget fill
-    doc_min_score: float = field(default_factory=lambda: _env_float("DOC_MIN_SCORE", 0.12))
-    drop_suspicious_chunks: bool = True
-    chunk_size: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))
-    chunk_overlap: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 80))
+    top_k_docs: int = field(default_factory=lambda: _env_int("TOP_K_DOCS", 5))          # [FIX-5] more candidates for budget fill; number of chunks retrieved before pruning.
+    doc_min_score: float = field(default_factory=lambda: _env_float("DOC_MIN_SCORE", 0.12))  # Lowest score a chunk should have before it is considered useful.
+    drop_suspicious_chunks: bool = True  # Remove chunks that look like prompts or injected instructions.
+    chunk_size: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))  # Target chunk size used during ingestion.
+    chunk_overlap: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 80))  # Shared overlap that preserves context across chunks.
     # [FIX-5] token budget: how many tokens to allocate to doc context in the prompt
-    doc_context_token_budget: int = field(default_factory=lambda: _env_int("DOC_CONTEXT_TOKEN_BUDGET", 1800))
+    doc_context_token_budget: int = field(default_factory=lambda: _env_int("DOC_CONTEXT_TOKEN_BUDGET", 1800))  # Hard budget for retrieved doc text injected into the prompt.
     # [FIX-4] hybrid retrieval weight: 0 = pure BM25, 1 = pure dense
-    hybrid_alpha: float = field(default_factory=lambda: _env_float("HYBRID_ALPHA", 0.6))
+    hybrid_alpha: float = field(default_factory=lambda: _env_float("HYBRID_ALPHA", 0.6))  # Blend between sparse and dense retrieval results.
 
     # memory
     # Memory is short-form and deduplicated to avoid repeating near-identical facts.
-    memory_min_score: float = field(default_factory=lambda: _env_float("MEMORY_MIN_SCORE", 0.18))
-    memory_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_MAX_CHARS", 420))
+    memory_min_score: float = field(default_factory=lambda: _env_float("MEMORY_MIN_SCORE", 0.18))  # Minimum score for a memory item to be recalled.
+    memory_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_MAX_CHARS", 420))  # Maximum length of a stored memory summary.
     # [FIX-7] deduplicate memory writes: skip if similarity to recent memory > threshold
-    memory_dedup_threshold: float = field(default_factory=lambda: _env_float("MEMORY_DEDUP_THRESHOLD", 0.82))
+    memory_dedup_threshold: float = field(default_factory=lambda: _env_float("MEMORY_DEDUP_THRESHOLD", 0.82))  # Avoid storing near-duplicate memories.
 
     # ram / monitoring
     # Runtime monitoring helps surface bottlenecks during long chat sessions.
-    enable_ram_cleanup: bool = field(default_factory=lambda: _env_bool("ENABLE_RAM_CLEANUP", True))
-    ram_cleanup_every_n_turns: int = field(default_factory=lambda: _env_int("RAM_CLEANUP_EVERY_N_TURNS", 6))
-    show_ram_stats: bool = field(default_factory=lambda: _env_bool("SHOW_RAM_STATS", False))
-    resource_monitor_enabled: bool = field(default_factory=lambda: _env_bool("RESOURCE_MONITOR_ENABLED", True))
-    resource_monitor_live: bool = field(default_factory=lambda: _env_bool("RESOURCE_MONITOR_LIVE", False))
-    resource_monitor_interval_sec: float = field(default_factory=lambda: _env_float("RESOURCE_MONITOR_INTERVAL_SEC", 1.0))
+    enable_ram_cleanup: bool = field(default_factory=lambda: _env_bool("ENABLE_RAM_CLEANUP", True))  # Run periodic memory cleanup after several turns.
+    ram_cleanup_every_n_turns: int = field(default_factory=lambda: _env_int("RAM_CLEANUP_EVERY_N_TURNS", 6))  # Cleanup cadence for reclaiming RAM.
+    show_ram_stats: bool = field(default_factory=lambda: _env_bool("SHOW_RAM_STATS", False))  # Print RAM stats in the UI when enabled.
+    resource_monitor_enabled: bool = field(default_factory=lambda: _env_bool("RESOURCE_MONITOR_ENABLED", True))  # Track CPU and memory usage during chat.
+    resource_monitor_live: bool = field(default_factory=lambda: _env_bool("RESOURCE_MONITOR_LIVE", False))  # Stream live resource stats instead of snapshots.
+    resource_monitor_interval_sec: float = field(default_factory=lambda: _env_float("RESOURCE_MONITOR_INTERVAL_SEC", 1.0))  # Polling interval for the resource monitor.
 
     # web search
     # Web settings control when to augment local knowledge with fresh external context.
-    web_search_enabled: bool = field(default_factory=lambda: _env_bool("WEB_SEARCH", True))
-    auto_web_fallback_on_empty_docs: bool = field(default_factory=lambda: _env_bool("AUTO_WEB_FALLBACK_ON_EMPTY_DOCS", True))
-    auto_web_min_query_words: int = field(default_factory=lambda: _env_int("AUTO_WEB_MIN_QUERY_WORDS", 4))
-    web_search_provider: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower())
-    web_search_pick_mode: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PICK_MODE", "auto").strip().lower())
-    web_search_default_providers: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily,firecrawl"))
-    web_search_max_providers: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_PROVIDERS", 3))
-    web_cache_ttl_sec: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SEC", 900))
-    web_cache_max_value_chars: int = field(default_factory=lambda: _env_int("WEB_CACHE_MAX_VALUE_CHARS", 8000))
+    web_search_enabled: bool = field(default_factory=lambda: _env_bool("WEB_SEARCH", True))  # Allow the assistant to fetch fresh web context.
+    auto_web_fallback_on_empty_docs: bool = field(default_factory=lambda: _env_bool("AUTO_WEB_FALLBACK_ON_EMPTY_DOCS", True))  # Query the web when local docs are empty.
+    auto_web_min_query_words: int = field(default_factory=lambda: _env_int("AUTO_WEB_MIN_QUERY_WORDS", 4))  # Minimum query length before auto web fallback.
+    web_search_provider: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower())  # Default provider used for web search.
+    web_search_pick_mode: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_PICK_MODE", "auto").strip().lower())  # How provider selection is decided.
+    web_search_default_providers: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_DEFAULT_PROVIDERS", "tavily,firecrawl"))  # Provider list used when auto-selecting.
+    web_search_max_providers: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_PROVIDERS", 3))  # Cap how many providers can be queried per turn.
+    web_cache_ttl_sec: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SEC", 900))  # Lifetime for cached web responses.
+    web_cache_max_value_chars: int = field(default_factory=lambda: _env_int("WEB_CACHE_MAX_VALUE_CHARS", 8000))  # Size limit for cached web payloads.
     # Prefer the tested modular web RAG pipeline for /web and web fallback.
-    web_pipeline_enabled: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_ENABLED", True))
-    web_pipeline_max_results: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_RESULTS", 8))
-    web_pipeline_max_pages: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_PAGES", 24))
-    web_pipeline_max_depth: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_DEPTH", 2))
-    web_pipeline_use_firecrawl: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_USE_FIRECRAWL", False))
-    web_pipeline_save_documents: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_SAVE_DOCUMENTS", False))
+    web_pipeline_enabled: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_ENABLED", True))  # Enable the modular search-to-retrieve web pipeline.
+    web_pipeline_max_results: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_RESULTS", 8))  # Maximum search results to feed into pipeline crawling.
+    web_pipeline_max_pages: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_PAGES", 24))  # Total page limit for pipeline crawling.
+    web_pipeline_max_depth: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_DEPTH", 2))  # Crawl depth allowed when expanding links.
+    web_pipeline_use_firecrawl: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_USE_FIRECRAWL", False))  # Prefer Firecrawl for web extraction when available.
+    web_pipeline_save_documents: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_SAVE_DOCUMENTS", False))  # Persist pipeline documents after ingestion.
     # [FIX-6] limit web snippet chars per provider before injection
-    web_snippet_max_chars: int = field(default_factory=lambda: _env_int("WEB_SNIPPET_MAX_CHARS", 600))
-    web_top_snippets: int = field(default_factory=lambda: _env_int("WEB_TOP_SNIPPETS", 5))
-    jina_reader_timeout_sec: int = field(default_factory=lambda: _env_int("JINA_READER_TIMEOUT_SEC", 12))
-    fetch_max_chars: int = field(default_factory=lambda: _env_int("FETCH_MAX_CHARS", 9000))
-    firecrawl_extract_max_chars: int = field(default_factory=lambda: _env_int("FIRECRAWL_EXTRACT_MAX_CHARS", 1200))
-    firecrawl_base_url: str = field(default_factory=lambda: os.getenv("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/"))
-    firecrawl_api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", ""))
-    firecrawl_max_urls: int = field(default_factory=lambda: _env_int("FIRECRAWL_MAX_URLS", 2))
+    web_snippet_max_chars: int = field(default_factory=lambda: _env_int("WEB_SNIPPET_MAX_CHARS", 600))  # Truncate provider snippets before sending them to the model.
+    web_top_snippets: int = field(default_factory=lambda: _env_int("WEB_TOP_SNIPPETS", 5))  # Number of web snippets kept for context.
+    jina_reader_timeout_sec: int = field(default_factory=lambda: _env_int("JINA_READER_TIMEOUT_SEC", 12))  # Timeout for Jina Reader fetches.
+    fetch_max_chars: int = field(default_factory=lambda: _env_int("FETCH_MAX_CHARS", 9000))  # Upper bound for fetched page text.
+    firecrawl_extract_max_chars: int = field(default_factory=lambda: _env_int("FIRECRAWL_EXTRACT_MAX_CHARS", 1200))  # Firecrawl extraction text cap.
+    firecrawl_base_url: str = field(default_factory=lambda: os.getenv("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/"))  # Firecrawl API endpoint.
+    firecrawl_api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", ""))  # Optional Firecrawl credential.
+    firecrawl_max_urls: int = field(default_factory=lambda: _env_int("FIRECRAWL_MAX_URLS", 2))  # Limit Firecrawl URL fetches per request.
 
     # [FIX-10] conversation sliding window: number of past (user, assistant) turns to include
     # Keeps prompts bounded while retaining recent conversational continuity.
-    conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 6))
-    session_recorder_max_turns: int = field(default_factory=lambda: _env_int("SESSION_RECORDER_MAX_TURNS", 250))
+    conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 6))  # Number of recent turns kept in the prompt.
+    session_recorder_max_turns: int = field(default_factory=lambda: _env_int("SESSION_RECORDER_MAX_TURNS", 250))  # Maximum stored turns in the session recorder.
 
     # API keys
     # Provider credentials are optional and only used when matching tools are called.
-    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
-    serpapi_api_key: str = field(default_factory=lambda: os.getenv("SERPAPI_API_KEY", ""))
-    langsearch_api_key: str = field(default_factory=lambda: os.getenv("LANGSEARCH_API_KEY", ""))
-    jina_api_key: str = field(default_factory=lambda: os.getenv("JINA_API_KEY", ""))
-    openweather_api_key: str = field(default_factory=lambda: os.getenv("OPENWEATHER_API_KEY", ""))
-    nvd_api_key: str = field(default_factory=lambda: os.getenv("NVD_API_KEY", ""))
+    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))  # Tavily search credential.
+    serpapi_api_key: str = field(default_factory=lambda: os.getenv("SERPAPI_API_KEY", ""))  # SerpAPI search credential.
+    langsearch_api_key: str = field(default_factory=lambda: os.getenv("LANGSEARCH_API_KEY", ""))  # LangSearch credential.
+    jina_api_key: str = field(default_factory=lambda: os.getenv("JINA_API_KEY", ""))  # Jina credential for reader/search tools.
+    openweather_api_key: str = field(default_factory=lambda: os.getenv("OPENWEATHER_API_KEY", ""))  # Weather API credential.
+    nvd_api_key: str = field(default_factory=lambda: os.getenv("NVD_API_KEY", ""))  # NVD API credential for CVE lookups.
 
     @property
     def chroma_dir(self) -> Path:
