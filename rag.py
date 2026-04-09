@@ -2095,9 +2095,21 @@ def _local_file_answer_style(source_filter: set[str]) -> str:
         "=== Answer constraints ===\n"
         f"You are answering from the referenced local file(s): {', '.join(files)}.\n"
         "Use only the retrieved document context for this turn.\n"
-        "Start with the file name. Then give 3 concise grounded points.\n"
+        "Start with the file name. Then use this format:\n"
+        "1. What the file is about.\n"
+        "2. 3 grounded key points.\n"
+        "3. If evidence is weak, say so clearly instead of guessing.\n"
         "If the retrieved text is weak or irrelevant, say that clearly and do not speculate.\n"
         "Quote or paraphrase only from the retrieved excerpts."
+    )
+
+
+def _compact_local_history_entry(source_filter: set[str], answer: str) -> str:
+    files = [Path(src).name for src in sorted(source_filter) if src]
+    file_text = ", ".join(files) if files else "local file"
+    return _clip_text(
+        f"Local-file QA for {file_text}. Assistant answered from retrieved excerpts: {answer}",
+        280,
     )
 
 
@@ -2496,6 +2508,11 @@ def chat() -> None:
                 embedder = get_embedder()
                 _ingest_paths(referenced_files, embedder, docs_col, show_status=False)
                 rebuild_bm25_index(docs_col)
+        route_label = "local_only" if local_only_turn else ("web_only" if web_only_mode else "hybrid_or_chat")
+        console.print(
+            f"[dim]Route: {route_label} | local_refs={len(referenced_files)} | "
+            f"web_allowed={not local_only_turn} | memory_allowed={not local_only_turn}[/dim]"
+        )
 
         # [FIX-4] Retrieve: hybrid BM25 + dense for local docs + semantic memory.
         if web_only_mode:
@@ -2507,6 +2524,8 @@ def chat() -> None:
                 q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
                 doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col, source_filter=source_filter)
                 mem_turns = [] if local_only_turn else retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
+
+        prompt_history = [] if local_only_turn else conversation_history
 
         # Auto web fallback if no strong local docs are found for this turn.
         if (
@@ -2538,8 +2557,9 @@ def chat() -> None:
             console.print(f"[dim]Tools: {list(tool_results.keys())}[/dim]")
 
         # [FIX-10] Build full messages array with sliding window history.
-        messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, conversation_history, source_filter=source_filter)
+        messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, prompt_history, source_filter=source_filter)
         active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
+        active_num_predict = CFG.ollama_chat_num_predict + (120 if local_only_turn else 0)
 
         full_response = ""
         t_gen = time.time()
@@ -2549,7 +2569,7 @@ def chat() -> None:
             full_response = generate_chat_response(
                 messages,
                 temperature=CFG.ollama_chat_temperature,
-                num_predict=CFG.ollama_chat_num_predict,
+                num_predict=active_num_predict,
                 num_ctx=active_num_ctx,
                 stream=True,
             )
@@ -2561,8 +2581,12 @@ def chat() -> None:
                     console.print("\n" + footer)
 
             # [FIX-10] Update sliding window conversation history with this turn.
-            conversation_history.append({"role": "user", "content": _history_text(query)})
-            conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
+            if local_only_turn:
+                conversation_history.append({"role": "user", "content": _compact_local_history_entry(source_filter, query)})
+                conversation_history.append({"role": "assistant", "content": _history_text(full_response, 300)})
+            else:
+                conversation_history.append({"role": "user", "content": _history_text(query)})
+                conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
 
             gen_time = time.time() - t_gen
@@ -2577,7 +2601,8 @@ def chat() -> None:
                 gen_time_sec=gen_time,
             )
             # [FIX-7] Memory deduplication happens inside save_memory
-            save_memory(query, full_response, get_embedder(), memory_col)
+            if not local_only_turn:
+                save_memory(query, full_response, get_embedder(), memory_col)
             turn_count += 1
             maybe_release_ram(turn_count)
 

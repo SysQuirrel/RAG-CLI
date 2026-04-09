@@ -1,3 +1,15 @@
+## 2026-04-10 00:04:51 IST
+
+Task summary:
+Refined local-file answers to sound less confused by making the prompt explicitly require a structured file-summary format, compacting local-file history entries, skipping memory recall on local-file turns, and logging the route decision for each turn.
+
+Commit:
+Structure local-file answers and compact local turn history
+
+Add a local-file answer style helper that requires file-name-first, evidence-based answers with a fixed summary format.
+Compact local-file history entries so prior file-QA turns do not bloat the prompt or reintroduce confusion.
+Emit a route log line and continue skipping semantic memory retrieval and memory writes for local-file turns.
+
 ## 2026-04-10 00:02:09 IST
 
 Task summary:
