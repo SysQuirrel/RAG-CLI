@@ -157,7 +157,7 @@ class Config:
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
     ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 8192))
     ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))
-    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 700))
+    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))
     ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.1))
     ollama_keep_alive: str = "10m"
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))
@@ -673,7 +673,11 @@ def retrieve_memory(query: str, embedder, memory_col, q_embed: list | None = Non
             continue
         score = 1 - dist if isinstance(dist, (int, float)) else 0.0
         ts = meta.get("ts", "") if isinstance(meta, dict) else ""
-        all_turns.append({"text": doc, "ts": ts, "score": score})
+        all_turns.append({
+            "text": _clip_text(doc.replace("\x00", "").strip(), CFG.memory_max_chars),
+            "ts": ts,
+            "score": score,
+        })
     turns = [t for t in all_turns if t["score"] >= CFG.memory_min_score]
     if not turns and all_turns:
         turns = sorted(all_turns, key=lambda x: x["score"], reverse=True)[:1]
@@ -724,14 +728,25 @@ class OllamaEmbedder:
         return resp["embeddings"]
 
 
-def load_embedder():
+def load_embedder(silent: bool = False):
     if CFG.use_ollama_embed:
-        console.print("[dim]Using nomic-embed-text via Ollama for embeddings.[/dim]")
+        if not silent:
+            console.print("[dim]Using nomic-embed-text via Ollama for embeddings.[/dim]")
         return OllamaEmbedder()
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     from sentence_transformers import SentenceTransformer
+    try:
+        from transformers.utils import logging as transformers_logging
+        transformers_logging.set_verbosity_error()
+        transformers_logging.disable_progress_bar()
+    except Exception:
+        pass
     device = "cuda" if CFG.use_gpu else "cpu"
-    with console.status(f"[dim]Loading embedding model (device: {device})...[/dim]", spinner="dots"):
+    if silent:
         m = SentenceTransformer(CFG.embed_model, device=device)
+    else:
+        with console.status(f"[dim]Loading embedding model (device: {device})...[/dim]", spinner="dots"):
+            m = SentenceTransformer(CFG.embed_model, device=device)
     return m
 
 
@@ -739,14 +754,28 @@ _EMBEDDER_INSTANCE: Any | None = None
 _EMBEDDER_LOCK = threading.Lock()
 
 
-def get_embedder():
+def get_embedder(silent: bool = False):
     """Load embedder once and reuse it across chat/ingest operations."""
     global _EMBEDDER_INSTANCE
     if _EMBEDDER_INSTANCE is None:
         with _EMBEDDER_LOCK:
             if _EMBEDDER_INSTANCE is None:
-                _EMBEDDER_INSTANCE = load_embedder()
+                _EMBEDDER_INSTANCE = load_embedder(silent=silent)
     return _EMBEDDER_INSTANCE
+
+
+def _is_tiny_chitchat(query: str) -> bool:
+    """Fast path for tiny greetings to avoid expensive retrieval on trivial turns."""
+    q = re.sub(r"[^a-z0-9\s]", "", query.lower()).strip()
+    if not q:
+        return False
+    if len(q.split()) > 3:
+        return False
+    return q in {
+        "hi", "hello", "hey", "yo", "sup", "hola",
+        "good morning", "good evening", "good afternoon",
+        "hii", "heyy", "hy",
+    }
 
 
 def _to_embedding_list(embeddings: Any) -> list:
@@ -2073,7 +2102,7 @@ def chat() -> None:
     mem_count = memory_col.count()
 
     # Prewarm embedder in background so startup remains responsive.
-    threading.Thread(target=get_embedder, daemon=True, name="embedder-prewarm").start()
+    threading.Thread(target=lambda: get_embedder(silent=True), daemon=True, name="embedder-prewarm").start()
 
     console.print(Panel(
         f"Model: {CFG.ollama_model}\n"
@@ -2156,6 +2185,36 @@ def chat() -> None:
         # Tool execution
         tool_results: dict[str, str] = {}
         web_only_mode = False
+
+        # Fast trivial-turn path: skip retrieval/memory/tool overhead for greetings.
+        if not cmd and _is_tiny_chitchat(cleaned_query):
+            fast_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a concise assistant. Reply briefly and naturally to greetings. "
+                        "Do not add unrelated context."
+                    ),
+                },
+                {"role": "user", "content": cleaned_query},
+            ]
+            t_gen = time.time()
+            full_response = generate_chat_response(
+                fast_messages,
+                temperature=0.2,
+                num_predict=64,
+                num_ctx=1024,
+                stream=False,
+            )
+            console.print(f"Assistant: {full_response}")
+            session_recorder.add_turn(query, full_response, tools=[], gen_time_sec=time.time() - t_gen)
+            conversation_history.append({"role": "user", "content": _history_text(query)})
+            conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
+            conversation_history = conversation_history[-(CFG.conversation_window * 2):]
+            turn_count += 1
+            maybe_release_ram(turn_count)
+            continue
+
         if cmd:
             if cmd != "help" and _is_help_arg(arg):
                 console.print(_command_usage_line(cmd))

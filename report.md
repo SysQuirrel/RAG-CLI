@@ -1,3 +1,16 @@
+## 2026-04-09 15:04:00 IST
+
+Task summary:
+Investigated slow chat responses and memory pressure, then optimized rag.py so trivial greetings return fast without retrieval overhead and reduced generation/runtime memory load.
+
+Commit:
+Reduce chat latency and memory pressure for trivial turns
+
+Lower default generation length to prevent overly long responses on simple prompts.
+Clip retrieved memory snippets before prompt injection to keep context compact.
+Add a tiny-chitchat fast path that skips retrieval and responds quickly for short greetings.
+Make embedder prewarm silent to avoid spinner/output interference with input prompt rendering.
+
 ## 2026-04-09 14:55:07 IST
 
 Task summary:
