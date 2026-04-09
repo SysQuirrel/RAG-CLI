@@ -228,7 +228,10 @@ class Config:
 
     @property
     def chroma_dir(self) -> Path:
-        return self.data_dir / "chroma"
+        override = os.getenv("CHROMA_DB_PATH", "").strip()
+        if override:
+            return Path(override).expanduser()
+        return Path(__file__).resolve().parent / "chroma_db"
 
     @property
     def session_export_dir(self) -> Path:
@@ -1865,6 +1868,30 @@ def _format_sources_footer(evidence_tags: list[str], max_items: int = 4) -> str:
     return ("Sources: " + " | ".join(items)) if items else ""
 
 
+def _display_source_label(source: Any) -> str | None:
+    """Return a user-facing source label, or None for placeholders to hide."""
+    if not source:
+        return None
+
+    text = str(source).strip()
+    if not text:
+        return None
+
+    name = Path(text).name
+    if name in {"memory_1.md", "memory_2.md"}:
+        return None
+    if name.lower().startswith("memory_") and not Path(text).exists():
+        return None
+
+    if re.match(r"^https?://", text, re.I):
+        return name or text
+
+    if Path(text).exists():
+        return name
+
+    return name
+
+
 def _is_tool_result_usable(content: str) -> bool:
     if not content or not content.strip():
         return False
@@ -2012,7 +2039,9 @@ def docs_list() -> None:
     sources: dict[str, int] = {}
     for meta in metadatas:
         source = meta.get("source", "?") if isinstance(meta, dict) else "?"
-        src = Path(str(source)).name
+        src = _display_source_label(source)
+        if not src:
+            continue
         sources[src] = sources.get(src, 0) + 1
     table = Table(title=f"Indexed documents ({count} total chunks)")
     table.add_column("File", style="cyan")
@@ -2314,7 +2343,11 @@ def chat() -> None:
 
         # Show sources
         if doc_chunks:
-            srcs = list(dict.fromkeys(Path(c["source"]).name for c in doc_chunks))
+            srcs: list[str] = []
+            for chunk in doc_chunks:
+                label = _display_source_label(chunk.get("source"))
+                if label and label not in srcs:
+                    srcs.append(label)
             console.print(f"[dim]Sources: {', '.join(srcs)}[/dim]")
         if mem_turns:
             console.print(f"[dim]Memory turns: {len(mem_turns)}[/dim]")

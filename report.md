@@ -1,3 +1,14 @@
+## 2026-04-09 15:17:00 IST
+
+Task summary:
+Removed the bogus memory_1.md and memory_2.md source labels from user-facing source displays and pointed the default Chroma database path back to the project-local chroma_db folder.
+
+Commit:
+Hide placeholder memory sources and use project-local Chroma DB path
+
+Add a source-label helper that suppresses placeholder memory filenames from docs and retrieval source displays.
+Change the default Chroma path to the project-local chroma_db directory, while still allowing CHROMA_DB_PATH to override it.
+
 ## 2026-04-09 15:04:00 IST
 
 Task summary:
