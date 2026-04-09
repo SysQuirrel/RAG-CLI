@@ -1,5 +1,7 @@
-"""
+"""Top-level CLI entrypoint for a local RAG system built on Ollama + ChromaDB.
+
 RAG CLI — Ollama + ChromaDB + hybrid retrieval + industry-standard improvements
+
 Usage:
     uv run python rag.py ingest <file_or_dir>    # index PDFs / text files
     uv run python rag.py chat                     # start chat session
@@ -51,7 +53,7 @@ from typing import Any, cast
 from pathlib import Path
 from datetime import datetime
 
-# ── deps ────────────────────────────────────────────────────────────────────
+# ── Core dependencies (LLM, vector DB, HTTP, CLI UI) ────────────────────────
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from chromadb.api import ClientAPI
@@ -68,28 +70,31 @@ from rich.table import Table
 from rich import print as rprint
 try:
     from rank_bm25 import BM25Okapi   # [FIX-4] sparse retrieval
+    # Toggle sparse retrieval support based on optional dependency availability.
     HAS_BM25 = True
 except ImportError:
     HAS_BM25 = False
 from runtime_features import WebSearchCache, SessionRecorder
 
+# Optional local web RAG pipeline; rag.py falls back to provider tools if absent.
 try:
-    # Reuse the modular pipeline built in this folder:
     # search -> crawl -> extract -> chunk -> embed -> store -> retrieve
     from pipeline import run_ingest as pipeline_run_ingest
     from pipeline import run_query as pipeline_run_query
+    # Signals that the modular local web RAG pipeline can be used end-to-end.
     HAS_WEB_PIPELINE = True
 except Exception:
     pipeline_run_ingest = None
     pipeline_run_query = None
+    # Keep CLI usable even when optional pipeline deps are missing.
     HAS_WEB_PIPELINE = False
 
-logger = logging.getLogger("rag_cli")
+logger = logging.getLogger("rag_cli")  # module-level logger used for diagnostics
 
 # ── [FIX-1] Config: single dataclass, env read exactly once ──────────────────
 
 def _load_local_env() -> None:
-    """Load key=value pairs from project .env without external dependencies."""
+    """Shallow .env loader so this script can run without python-dotenv."""
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
@@ -105,6 +110,7 @@ def _load_local_env() -> None:
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean flag from the environment with a safe default."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -112,6 +118,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
+    """Read an integer from the environment, falling back on parse errors."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -122,6 +129,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
+    """Read a float from the environment, falling back on parse errors."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -132,6 +140,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _detect_cuda() -> bool:
+    """Return True if a CUDA-capable GPU is visible to PyTorch."""
     try:
         import torch
         return bool(torch.cuda.is_available())
@@ -143,15 +152,18 @@ def _detect_cuda() -> bool:
 class Config:
     """All settings, read from env exactly once at startup. [FIX-1]"""
     # paths
+    # Root directory for local persistent state (index, exports, cache metadata).
     data_dir: Path = field(default_factory=lambda: Path.home() / ".rag-cli")
 
     # embedding
+    # Embedding defaults are tuned for fast local retrieval quality.
     embed_model: str = "all-MiniLM-L6-v2"
     use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))
     ollama_embed_model: str = "nomic-embed-text:latest"
     use_gpu: bool = field(default_factory=_detect_cuda)
 
-    # ollama / generationqwen3.5:4b-q4_K_M
+    # ollama / generation
+    # Controls model choice, latency, and output style for chat answers.
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
@@ -163,6 +175,7 @@ class Config:
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))
 
     # retrieval
+    # Retrieval thresholds govern recall/precision tradeoffs and chunk granularity.
     top_k_docs: int = field(default_factory=lambda: _env_int("TOP_K_DOCS", 5))          # [FIX-5] more candidates for budget fill
     doc_min_score: float = field(default_factory=lambda: _env_float("DOC_MIN_SCORE", 0.12))
     drop_suspicious_chunks: bool = True
@@ -174,12 +187,14 @@ class Config:
     hybrid_alpha: float = field(default_factory=lambda: _env_float("HYBRID_ALPHA", 0.6))
 
     # memory
+    # Memory is short-form and deduplicated to avoid repeating near-identical facts.
     memory_min_score: float = field(default_factory=lambda: _env_float("MEMORY_MIN_SCORE", 0.18))
     memory_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_MAX_CHARS", 420))
     # [FIX-7] deduplicate memory writes: skip if similarity to recent memory > threshold
     memory_dedup_threshold: float = field(default_factory=lambda: _env_float("MEMORY_DEDUP_THRESHOLD", 0.82))
 
     # ram / monitoring
+    # Runtime monitoring helps surface bottlenecks during long chat sessions.
     enable_ram_cleanup: bool = field(default_factory=lambda: _env_bool("ENABLE_RAM_CLEANUP", True))
     ram_cleanup_every_n_turns: int = field(default_factory=lambda: _env_int("RAM_CLEANUP_EVERY_N_TURNS", 6))
     show_ram_stats: bool = field(default_factory=lambda: _env_bool("SHOW_RAM_STATS", False))
@@ -188,6 +203,7 @@ class Config:
     resource_monitor_interval_sec: float = field(default_factory=lambda: _env_float("RESOURCE_MONITOR_INTERVAL_SEC", 1.0))
 
     # web search
+    # Web settings control when to augment local knowledge with fresh external context.
     web_search_enabled: bool = field(default_factory=lambda: _env_bool("WEB_SEARCH", True))
     auto_web_fallback_on_empty_docs: bool = field(default_factory=lambda: _env_bool("AUTO_WEB_FALLBACK_ON_EMPTY_DOCS", True))
     auto_web_min_query_words: int = field(default_factory=lambda: _env_int("AUTO_WEB_MIN_QUERY_WORDS", 4))
@@ -215,10 +231,12 @@ class Config:
     firecrawl_max_urls: int = field(default_factory=lambda: _env_int("FIRECRAWL_MAX_URLS", 2))
 
     # [FIX-10] conversation sliding window: number of past (user, assistant) turns to include
+    # Keeps prompts bounded while retaining recent conversational continuity.
     conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 6))
     session_recorder_max_turns: int = field(default_factory=lambda: _env_int("SESSION_RECORDER_MAX_TURNS", 250))
 
     # API keys
+    # Provider credentials are optional and only used when matching tools are called.
     tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
     serpapi_api_key: str = field(default_factory=lambda: os.getenv("SERPAPI_API_KEY", ""))
     langsearch_api_key: str = field(default_factory=lambda: os.getenv("LANGSEARCH_API_KEY", ""))
@@ -228,13 +246,17 @@ class Config:
 
     @property
     def chroma_dir(self) -> Path:
+        """On-disk location for the persistent ChromaDB store."""
         return self.data_dir / "chroma"
 
     @property
     def session_export_dir(self) -> Path:
+        """Directory where exported chat transcripts are written."""
         return self.data_dir / "exports"
 
 
+# Load environment-backed configuration once at import time and ensure
+# the base data directory (~/.rag-cli by default) exists on disk.
 _load_local_env()
 CFG = Config()
 CFG.data_dir.mkdir(parents=True, exist_ok=True)

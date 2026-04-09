@@ -1,3 +1,15 @@
+## 2026-04-09 19:08:01 IST
+
+Task summary:
+Added purpose-focused comments in the top configuration section of rag.py (lines 0-233) to explain the role of key flags, config groups, and environment-backed settings without changing behavior.
+
+Commit:
+Document purpose of top-level config variables in rag.py
+
+Annotate BM25 and web-pipeline capability flags so optional dependency behavior is clear at startup.
+Add concise section-purpose comments for embedding, generation, retrieval, memory, monitoring, web search, conversation window, and API key groups in Config.
+Preserve runtime logic and verify syntax remains clean after the comment-only update.
+
 ## 2026-04-09 16:40:00 IST
 
 Task summary:
