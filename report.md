@@ -1,3 +1,15 @@
+## 2026-04-09 14:55:07 IST
+
+Task summary:
+Removed noisy startup/download logs from chat runs and reduced first-turn latency by caching the embedder and prewarming it in a background thread instead of blocking chat startup.
+
+Commit:
+Silence embedding startup noise and prewarm cached embedder in chat
+
+Set Hugging Face and transformer runtime verbosity knobs to quiet mode and raise noisy third-party logger levels to warning.
+Add a thread-safe singleton embedder cache and use it across ingest and chat paths.
+Start embedder prewarm in the background when chat opens so the prompt appears immediately while model initialization continues asynchronously.
+
 ## 2026-04-09 13:57:25 IST
 
 Task summary:

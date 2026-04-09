@@ -73,6 +73,17 @@ except ImportError:
     HAS_BM25 = False
 from runtime_features import WebSearchCache, SessionRecorder
 
+try:
+    # Reuse the modular pipeline built in this folder:
+    # search -> crawl -> extract -> chunk -> embed -> store -> retrieve
+    from pipeline import run_ingest as pipeline_run_ingest
+    from pipeline import run_query as pipeline_run_query
+    HAS_WEB_PIPELINE = True
+except Exception:
+    pipeline_run_ingest = None
+    pipeline_run_query = None
+    HAS_WEB_PIPELINE = False
+
 logger = logging.getLogger("rag_cli")
 
 # ── [FIX-1] Config: single dataclass, env read exactly once ──────────────────
@@ -140,8 +151,8 @@ class Config:
     ollama_embed_model: str = "nomic-embed-text:latest"
     use_gpu: bool = field(default_factory=_detect_cuda)
 
-    # ollama / generation
-    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen3.5:4b-q4_K_M"))
+    # ollama / generationqwen3.5:4b-q4_K_M
+    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
     ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 8192))
@@ -186,6 +197,13 @@ class Config:
     web_search_max_providers: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_PROVIDERS", 3))
     web_cache_ttl_sec: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SEC", 900))
     web_cache_max_value_chars: int = field(default_factory=lambda: _env_int("WEB_CACHE_MAX_VALUE_CHARS", 8000))
+    # Prefer the tested modular web RAG pipeline for /web and web fallback.
+    web_pipeline_enabled: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_ENABLED", True))
+    web_pipeline_max_results: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_RESULTS", 8))
+    web_pipeline_max_pages: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_PAGES", 24))
+    web_pipeline_max_depth: int = field(default_factory=lambda: _env_int("WEB_PIPELINE_MAX_DEPTH", 2))
+    web_pipeline_use_firecrawl: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_USE_FIRECRAWL", False))
+    web_pipeline_save_documents: bool = field(default_factory=lambda: _env_bool("WEB_PIPELINE_SAVE_DOCUMENTS", False))
     # [FIX-6] limit web snippet chars per provider before injection
     web_snippet_max_chars: int = field(default_factory=lambda: _env_int("WEB_SNIPPET_MAX_CHARS", 600))
     web_top_snippets: int = field(default_factory=lambda: _env_int("WEB_TOP_SNIPPETS", 5))
@@ -220,6 +238,27 @@ class Config:
 _load_local_env()
 CFG = Config()
 CFG.data_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _configure_quiet_runtime_logs() -> None:
+    """Reduce noisy third-party startup logs while keeping app logs readable."""
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    for name in (
+        "httpx",
+        "httpcore",
+        "sentence_transformers",
+        "transformers",
+        "huggingface_hub",
+        "filelock",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+_configure_quiet_runtime_logs()
 
 # ── [FIX-2] ChromaDB singleton ────────────────────────────────────────────────
 
@@ -696,6 +735,20 @@ def load_embedder():
     return m
 
 
+_EMBEDDER_INSTANCE: Any | None = None
+_EMBEDDER_LOCK = threading.Lock()
+
+
+def get_embedder():
+    """Load embedder once and reuse it across chat/ingest operations."""
+    global _EMBEDDER_INSTANCE
+    if _EMBEDDER_INSTANCE is None:
+        with _EMBEDDER_LOCK:
+            if _EMBEDDER_INSTANCE is None:
+                _EMBEDDER_INSTANCE = load_embedder()
+    return _EMBEDDER_INSTANCE
+
+
 def _to_embedding_list(embeddings: Any) -> list:
     if hasattr(embeddings, "tolist"):
         return embeddings.tolist()
@@ -896,7 +949,7 @@ SKIP_INGEST_FILENAMES = {"memory_1.md", "memory_2.md"}
 
 
 def ingest(paths: list[str]) -> None:
-    embedder = load_embedder()
+    embedder = get_embedder()
     client = get_chroma()
     docs_col, _ = get_collections(client)
 
@@ -1366,6 +1419,79 @@ def tool_fetch_url(url: str) -> str:
         return f"[Fetch error] {e}"
 
 
+def tool_web_pipeline(query: str) -> str:
+    """
+    Run the tested local modular web retrieval pipeline end-to-end.
+    Returns compact scored snippets in the same text contract used by web tools.
+    """
+    if not CFG.web_pipeline_enabled:
+        return "[Web pipeline] Disabled by config."
+    if not HAS_WEB_PIPELINE or pipeline_run_ingest is None or pipeline_run_query is None:
+        return "[Web pipeline error] pipeline.py is unavailable."
+
+    try:
+        summary = pipeline_run_ingest(
+            query=query,
+            max_search_results=CFG.web_pipeline_max_results,
+            max_pages=CFG.web_pipeline_max_pages,
+            max_depth=CFG.web_pipeline_max_depth,
+            use_firecrawl=CFG.web_pipeline_use_firecrawl,
+            save_documents=CFG.web_pipeline_save_documents,
+        )
+        results = pipeline_run_query(
+            query=query,
+            top_k=max(1, CFG.web_top_snippets),
+            min_score=max(0.20, CFG.doc_min_score),
+            domain_filter=None,
+            print_context=False,
+        )
+    except Exception as e:
+        return f"[Web pipeline error] {e}"
+
+    if not results:
+        return (
+            "[Web pipeline] No retrieval results after ingest.\n"
+            f"search={summary.get('search_results', 0)}, "
+            f"crawled={summary.get('pages_crawled', 0)}, "
+            f"docs={summary.get('documents_extracted', 0)}, "
+            f"chunks={summary.get('chunks_stored', 0)}"
+        )
+
+    lines = []
+    for item in results[: max(1, CFG.web_top_snippets)]:
+        title = (item.get("title") or "(no title)").strip()
+        url = (item.get("url") or "").strip()
+        text = _clip_text(
+            " ".join(str(item.get("text", "")).split()),
+            CFG.web_snippet_max_chars,
+        )
+        lines.append(f"- {title}\n  URL: {url}\n  Snippet: {text}")
+
+    header = (
+        f"[Web pipeline ingest] search={summary.get('search_results', 0)}; "
+        f"crawled={summary.get('pages_crawled', 0)}; "
+        f"docs={summary.get('documents_extracted', 0)}; "
+        f"chunks={summary.get('chunks_stored', 0)}"
+    )
+    # Keep same section shape used by evidence parser/scoring helpers.
+    return f"=== pipeline ===\n{header}\n\n" + "\n\n".join(lines)
+
+
+def _run_web_lookup(query: str, interactive: bool = False) -> str:
+    """Prefer the modular pipeline, then fall back to multi-provider search."""
+    if CFG.web_pipeline_enabled and HAS_WEB_PIPELINE:
+        if interactive:
+            console.print("[dim]Strategy: modular web RAG pipeline (search->crawl->extract->chunk->embed->store->retrieve).[/dim]")
+        pipeline_result = tool_web_pipeline(query)
+        if _is_tool_result_usable(pipeline_result):
+            return pipeline_result
+        if interactive:
+            console.print("[yellow]Pipeline unavailable/insufficient, falling back to provider web search.[/yellow]")
+
+    selected = _resolve_web_providers(query, interactive=interactive)
+    return tool_web_search_multi(query, selected)
+
+
 def _tool_web_search_single(query: str, provider: str) -> str:
     if provider == "serpapi":
         return _clip_text(tool_serpapi_search(query), CFG.web_snippet_max_chars * CFG.web_top_snippets)
@@ -1421,8 +1547,7 @@ def tool_web_search_multi(query: str, providers: list[str]) -> str:
 def web_search(query: str) -> str:
     if not CFG.web_search_enabled:
         return ""
-    providers = _resolve_web_providers(query, interactive=False)
-    return tool_web_search_multi(query, providers)
+    return _run_web_lookup(query, interactive=False)
 
 
 # ── Weather / CVE / DNS ───────────────────────────────────────────────────────
@@ -1593,7 +1718,7 @@ def _auto_detect_tools(query: str) -> dict[str, str]:
 def _resolve_web_providers(query: str, interactive: bool) -> list[str]:
     planned = _default_provider_selection()
     if interactive:
-        console.print(f"[dim]Strategy: default combined pipeline -> {', '.join(planned)}[/dim]")
+        console.print(f"[dim]Provider fallback strategy -> {', '.join(planned)}[/dim]")
     return planned
 
 
@@ -1615,8 +1740,9 @@ def _show_provider_status() -> None:
 
 
 def _provider_status_text() -> str:
+    pipeline_state = "ready" if (CFG.web_pipeline_enabled and HAS_WEB_PIPELINE) else "unavailable"
+    lines = [f"- pipeline: {pipeline_state} [preferred for /web]"]
     defaults = set(_default_provider_selection())
-    lines = []
     for provider in WEB_PROVIDER_ORDER:
         reason = _provider_unavailable_reason(provider)
         status = "ready" if not reason else f"unavailable ({reason})"
@@ -1716,7 +1842,7 @@ def _is_tool_result_usable(content: str) -> bool:
     failure_markers = [
         "no api key set", "[tavily error]", "[serpapi error]", "[langsearch error]",
         "[jina error]", "[firecrawl error]", "[fetch error]", "[weather error]",
-        "[cve error]", "[dns error]",
+        "[cve error]", "[dns error]", "[web pipeline error]",
     ]
     return not any(m in content.lower() for m in failure_markers)
 
@@ -1928,7 +2054,6 @@ def memory_clear() -> None:
 # ── Chat loop ─────────────────────────────────────────────────────────────────
 
 def chat() -> None:
-    embedder = load_embedder()
     client = get_chroma()
     docs_col, memory_col = get_collections(client)
     session_recorder = SessionRecorder(max_turns=CFG.session_recorder_max_turns)
@@ -1946,6 +2071,9 @@ def chat() -> None:
 
     doc_count = docs_col.count()
     mem_count = memory_col.count()
+
+    # Prewarm embedder in background so startup remains responsive.
+    threading.Thread(target=get_embedder, daemon=True, name="embedder-prewarm").start()
 
     console.print(Panel(
         f"Model: {CFG.ollama_model}\n"
@@ -2004,7 +2132,7 @@ def chat() -> None:
             )
             console.print(f"Assistant: {direct}")
             session_recorder.add_turn(query, direct, tools=[])
-            save_memory(query, direct, embedder, memory_col)
+            save_memory(query, direct, get_embedder(), memory_col)
             # [FIX-10] update history
             conversation_history.append({"role": "user", "content": _history_text(query)})
             conversation_history.append({"role": "assistant", "content": _history_text(direct)})
@@ -2017,7 +2145,7 @@ def chat() -> None:
             direct = _command_help_response(cleaned_query)
             console.print(f"Assistant: {direct}")
             session_recorder.add_turn(query, direct, tools=[])
-            save_memory(query, direct, embedder, memory_col)
+            save_memory(query, direct, get_embedder(), memory_col)
             conversation_history.append({"role": "user", "content": _history_text(query)})
             conversation_history.append({"role": "assistant", "content": _history_text(direct)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
@@ -2035,8 +2163,7 @@ def chat() -> None:
 
             if cmd == "web":
                 web_query = arg or cleaned_query
-                selected_providers = _resolve_web_providers(web_query, interactive=True)
-                tool_results["Web search"] = tool_web_search_multi(web_query, selected_providers)
+                tool_results["Web search"] = _run_web_lookup(web_query, interactive=True)
                 web_only_mode = True
             elif cmd == "fetch":
                 tool_results["Fetched page"] = tool_fetch_url(arg)
@@ -2090,8 +2217,7 @@ def chat() -> None:
             auto_tools = _auto_detect_tools(cleaned_query)
             for tool_name, tool_arg in auto_tools.items():
                 if tool_name == "web":
-                    selected_providers = _resolve_web_providers(tool_arg, interactive=False)
-                    tool_results["Web search"] = tool_web_search_multi(tool_arg, selected_providers)
+                    tool_results["Web search"] = _run_web_lookup(tool_arg, interactive=False)
                 elif tool_name == "weather":
                     tool_results["Weather"] = tool_weather(tool_arg)
                 elif tool_name == "cve":
@@ -2107,6 +2233,7 @@ def chat() -> None:
             mem_turns = []
         else:
             with console.status("[dim]Retrieving context...[/dim]", spinner="dots"):
+                embedder = get_embedder()
                 q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
                 doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col)
                 mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
@@ -2121,9 +2248,8 @@ def chat() -> None:
             and len(cleaned_query.split()) >= max(1, CFG.auto_web_min_query_words)
             and len(doc_chunks) == 0
         ):
-            selected_providers = _resolve_web_providers(cleaned_query, interactive=False)
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):
-                compact = tool_web_search_multi(cleaned_query, selected_providers)
+                compact = _run_web_lookup(cleaned_query, interactive=False)
             if compact and not compact.startswith("[Web search]"):
                 tool_results["Web search"] = compact
 
@@ -2219,7 +2345,7 @@ def chat() -> None:
                 gen_time_sec=gen_time,
             )
             # [FIX-7] Memory deduplication happens inside save_memory
-            save_memory(query, full_response, embedder, memory_col)
+            save_memory(query, full_response, get_embedder(), memory_col)
             turn_count += 1
             maybe_release_ram(turn_count)
 
