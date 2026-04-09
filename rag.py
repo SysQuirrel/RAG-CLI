@@ -195,8 +195,8 @@ class Config:
 
     # memory
     # Memory is short-form and deduplicated to avoid repeating near-identical facts.
-    memory_min_score: float = field(default_factory=lambda: _env_float("MEMORY_MIN_SCORE", 0.18))  # Minimum score for a memory item to be recalled.
-    memory_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_MAX_CHARS", 420))  # Maximum length of a stored memory summary.
+    memory_min_score: float = field(default_factory=lambda: _env_float("MEMORY_MIN_SCORE", 0.28))  # Minimum score for a memory item to be recalled.
+    memory_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_MAX_CHARS", 240))  # Maximum length of a stored memory summary.
     # [FIX-7] deduplicate memory writes: skip if similarity to recent memory > threshold
     memory_dedup_threshold: float = field(default_factory=lambda: _env_float("MEMORY_DEDUP_THRESHOLD", 0.82))  # Avoid storing near-duplicate memories.
 
@@ -239,7 +239,7 @@ class Config:
 
     # [FIX-10] conversation sliding window: number of past (user, assistant) turns to include
     # Keeps prompts bounded while retaining recent conversational continuity.
-    conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 6))  # Number of recent turns kept in the prompt.
+    conversation_window: int = field(default_factory=lambda: _env_int("CONVERSATION_WINDOW", 3))  # Number of recent turns kept in the prompt.
     session_recorder_max_turns: int = field(default_factory=lambda: _env_int("SESSION_RECORDER_MAX_TURNS", 250))  # Maximum stored turns in the session recorder.
 
     # API keys
@@ -928,6 +928,7 @@ def build_messages(
     mem_turns: list[dict],
     tool_results: dict[str, str],
     conversation_history: list[dict],   # [FIX-10]
+    source_filter: set[str] | None = None,
 ) -> list[dict]:
     """
     Build the full messages array for Ollama:
@@ -940,6 +941,11 @@ def build_messages(
     if mem_turns:
         parts.append("=== Relevant past conversation (factual notes) ===")
         parts.extend(t["text"] for t in mem_turns)
+
+    if source_filter:
+        local_style = _local_file_answer_style(source_filter)
+        if local_style:
+            parts.append(local_style)
 
     if doc_chunks:
         # [FIX-9] Wrap each chunk in XML role fence: role=untrusted-data
@@ -2081,6 +2087,20 @@ def _history_text(text: str, max_chars: int = 1200) -> str:
     return _clip_text(text or "", max_chars)
 
 
+def _local_file_answer_style(source_filter: set[str]) -> str:
+    files = [Path(src).name for src in sorted(source_filter) if src]
+    if not files:
+        return ""
+    return (
+        "=== Answer constraints ===\n"
+        f"You are answering from the referenced local file(s): {', '.join(files)}.\n"
+        "Use only the retrieved document context for this turn.\n"
+        "Start with the file name. Then give 3 concise grounded points.\n"
+        "If the retrieved text is weak or irrelevant, say that clearly and do not speculate.\n"
+        "Quote or paraphrase only from the retrieved excerpts."
+    )
+
+
 def _response_falsely_denies_web_access(text: str) -> bool:
     lowered = (text or "").lower()
     return any(m in lowered for m in [
@@ -2486,7 +2506,7 @@ def chat() -> None:
                 embedder = get_embedder()
                 q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
                 doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col, source_filter=source_filter)
-                mem_turns = retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
+                mem_turns = [] if local_only_turn else retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
 
         # Auto web fallback if no strong local docs are found for this turn.
         if (
@@ -2518,7 +2538,7 @@ def chat() -> None:
             console.print(f"[dim]Tools: {list(tool_results.keys())}[/dim]")
 
         # [FIX-10] Build full messages array with sliding window history.
-        messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, conversation_history)
+        messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, conversation_history, source_filter=source_filter)
         active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
 
         full_response = ""

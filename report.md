@@ -1,3 +1,15 @@
+## 2026-04-10 00:02:09 IST
+
+Task summary:
+Made file-question turns more reliable by keeping local-file routing local-only, reducing memory recall on those turns, and injecting a grounded answer contract that forces the model to start from the referenced file and give concise evidence-based points instead of drifting into vague summaries.
+
+Commit:
+Strengthen local-file grounding and reduce memory on file turns
+
+Lower memory recall defaults and conversation window to reduce prompt bloat.
+Add a local-file answer style helper so file-question prompts explicitly name the referenced file and require grounded, non-speculative summaries.
+Skip semantic memory retrieval on local-file turns and pass the source scope into the prompt builder so the model sees the active file constraint directly.
+
 ## 2026-04-09 23:46:36 IST
 
 Task summary:
