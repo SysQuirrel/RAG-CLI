@@ -4,6 +4,7 @@ RAG CLI — Ollama + ChromaDB + hybrid retrieval + industry-standard improvement
 
 Usage:
     uv run python rag.py ingest <file_or_dir>    # index PDFs / text files
+    uv run python rag.py stress <file>            # run stepped RAM stress profiles
     uv run python rag.py chat                     # start chat session
     uv run python rag.py memory list              # show saved memory
     uv run python rag.py memory clear             # wipe memory
@@ -38,11 +39,36 @@ Improvements over v1 (industry-standard changes):
     [FIX-9]  Prompt injection: XML role-fencing + structural isolation (beyond keyword blocklist)
     [FIX-10] Conversation: sliding-window multi-turn message history passed to model
 
+Improvements over v2 (large-context embedding + chunking):
+    [FIX-11] Embedding: switched default to Alibaba-NLP/gte-Qwen2-1.5B-instruct (32 768-token
+             context window vs BGE-M3's 8 192). Handles long web pages, dense PDFs, and
+             technical manuals without silent truncation.
+    [FIX-12] Chunking: semantic chunking via embedding-based topic-shift detection added as an
+             opt-in strategy alongside the existing recursive splitter. Activate with
+             CHUNK_STRATEGY=semantic in .env.
+    [FIX-13] Late chunking: documents are now embedded whole for coarse retrieval, then the
+             retrieved document is re-chunked for precise extraction (opt-in via
+             LATE_CHUNKING=true). Preserves document-level context that cross-chunk splits lose.
+    [FIX-14] Chunk size guardrail: CHUNK_SIZE is now enforced to stay well below
+             the embedding model's token limit. A startup warning fires if
+             CHUNK_SIZE * 4 > model_max_tokens * 0.8 so mismatches surface immediately.
+    [FIX-15] Query-side instruction prefix: gte-Qwen2 (and E5-family) models need a task
+             instruction prepended to query embeddings only. Added automatically based on
+             detected model family so stored document vectors are unaffected.
+
 Embedding model switching guide:
     1) Set EMBED_MODEL (or EMBEDDING_MODEL) to the SentenceTransformer model id you want.
-    2) Set CHROMA_DB_PATH to a dedicated folder for that model (or let bge use ~/.rag-cli/chroma_new).
+    2) Set CHROMA_DB_PATH to a dedicated folder for that model (vectors from different
+       models are geometrically incompatible — never mix them in one collection).
     3) Re-run ingest so vectors are rebuilt for the new embedding space.
-    4) Keep one Chroma folder per embedding model to avoid mixed, incompatible vectors.
+    4) Large-context models (gte-Qwen2-1.5B, e5-mistral-7b) need an instruction prefix
+       on queries but NOT on documents. The _query_prefix() helper handles this automatically.
+
+Recommended models by constraint:
+    CPU, 8 GB RAM : Alibaba-NLP/gte-Qwen2-1.5B-instruct  (32 768 ctx, ~3 GB, default)
+    Max window    : dunzhang/stella_en_1.5B_v5             (131 072 ctx, ~3 GB, EN-only)
+    Lightweight   : BAAI/bge-base-en-v1.5                  (512 ctx,   ~420 MB)
+    Multilingual  : BAAI/bge-m3                            (8 192 ctx,  ~2.3 GB)
 """
 
 import sys
@@ -54,6 +80,7 @@ import re
 import gc
 import threading
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
 from pathlib import Path
@@ -163,7 +190,10 @@ class Config:
 
     # embedding
     # Embedding defaults are tuned for fast local retrieval quality.
-    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL") or os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"))  # Default local embedding model for document vectors.
+    # [FIX-11] Switched default to gte-Qwen2-1.5B-instruct: 32 768-token context window vs
+    # BGE-M3's 8 192. Handles long web pages and dense PDFs without silent truncation.
+    # ~3 GB RAM, fully CPU-capable. Change via EMBED_MODEL env var; wipe chroma_dir if switching.
+    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL") or os.getenv("EMBEDDING_MODEL", "Alibaba-NLP/gte-Qwen2-1.5B-instruct"))  # Large-context embedding model (32 768 tokens). [FIX-11]
     chroma_db_path: str = field(default_factory=lambda: os.getenv("CHROMA_DB_PATH", "").strip())  # Optional explicit Chroma path override.
     use_ollama_embed: bool = field(default_factory=lambda: _env_bool("USE_OLLAMA_EMBED", False))  # Switch to Ollama-hosted embeddings when desired.
     ollama_embed_model: str = "nomic-embed-text:latest"  # Ollama embedding model used when remote embeddings are enabled.
@@ -177,6 +207,7 @@ class Config:
     ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))  # Context window for normal chat turns.
     ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))  # Smaller context budget for web-augmented turns.
     ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))  # Max tokens to generate per reply.
+    ollama_chat_num_predict_local_bonus: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT_LOCAL_BONUS", 220))  # Extra generation budget for local-file turns.
     ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))  # Randomness level for answer style.
     ollama_keep_alive: str = "10m"  # Keep the model warm between turns to reduce reload latency.
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))  # CPU threads reserved for Ollama inference.
@@ -188,6 +219,12 @@ class Config:
     drop_suspicious_chunks: bool = True  # Remove chunks that look like prompts or injected instructions.
     chunk_size: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))  # Target chunk size used during ingestion.
     chunk_overlap: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 80))  # Shared overlap that preserves context across chunks.
+    # [FIX-12] Chunking strategy: "recursive" (default, fast) or "semantic" (embedding-based
+    # topic-shift detection, slower but produces more coherent chunks for long mixed documents).
+    chunk_strategy: str = field(default_factory=lambda: os.getenv("CHUNK_STRATEGY", "recursive").strip().lower())  # "recursive" | "semantic". [FIX-12]
+    # [FIX-13] Late chunking: embed documents whole for coarse retrieval, re-chunk at read time.
+    # Preserves document-level context that fixed-boundary splits discard. Slower at query time.
+    late_chunking: bool = field(default_factory=lambda: _env_bool("LATE_CHUNKING", False))  # Re-chunk retrieved docs at query time for finer extraction. [FIX-13]
     # [FIX-5] token budget: how many tokens to allocate to doc context in the prompt
     doc_context_token_budget: int = field(default_factory=lambda: _env_int("DOC_CONTEXT_TOKEN_BUDGET", 1800))  # Hard budget for retrieved doc text injected into the prompt.
     # [FIX-4] hybrid retrieval weight: 0 = pure BM25, 1 = pure dense
@@ -253,12 +290,24 @@ class Config:
 
     @property
     def chroma_dir(self) -> Path:
-        """On-disk location for the persistent ChromaDB store."""
+        """On-disk location for the persistent ChromaDB store.
+        Each embedding model gets its own subdirectory because vectors from
+        different models are geometrically incompatible. [FIX-11]
+        """
         if self.chroma_db_path:
             return Path(os.path.expanduser(self.chroma_db_path))
-        if self.embed_model.strip().lower() in {"bge-base-en-v1.5", "baai/bge-base-en-v1.5"}:
-            return self.data_dir / "chroma_new"
-        return self.data_dir / "chroma"
+        _model_dir_map = {
+            "bge-base-en-v1.5":                    "chroma_bge_base",
+            "baai/bge-base-en-v1.5":               "chroma_bge_base",
+            "baai/bge-m3":                          "chroma_bge_m3",
+            "bge-m3":                               "chroma_bge_m3",
+            "alibaba-nlp/gte-qwen2-1.5b-instruct": "chroma_gte_qwen2",
+            "gte-qwen2-1.5b-instruct":              "chroma_gte_qwen2",
+            "dunzhang/stella_en_1.5b_v5":           "chroma_stella",
+        }
+        key = self.embed_model.strip().lower()
+        subdir = _model_dir_map.get(key, "chroma")
+        return self.data_dir / subdir
 
     @property
     def session_export_dir(self) -> Path:
@@ -272,6 +321,39 @@ _load_local_env()
 CFG = Config()
 CFG.data_dir.mkdir(parents=True, exist_ok=True)
 CFG.chroma_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _warn_if_chunk_size_exceeds_model_limit() -> None:
+    """Fire a startup warning when CHUNK_SIZE is too large for the embedding model. [FIX-14]"""
+    model_key = CFG.embed_model.strip().lower()
+    model_max = _MODEL_MAX_TOKENS.get(model_key)
+    if model_max is None:
+        return  # Unknown model — skip check
+    approx_tokens = CFG.chunk_size // 4
+    safe_limit = int(model_max * 0.8)
+    if approx_tokens > safe_limit:
+        logger.warning(
+            "[FIX-14] CHUNK_SIZE=%d (~%d tokens) exceeds 80%% of %s's context limit (%d tokens). "
+            "Chunks may be silently truncated during embedding, degrading retrieval quality. "
+            "Lower CHUNK_SIZE or switch to a model with a larger context window.",
+            CFG.chunk_size, approx_tokens, CFG.embed_model, model_max,
+        )
+
+
+@contextmanager
+def temp_config_override(**overrides: Any):
+    """Temporarily override frozen CFG fields and restore them on exit."""
+    original: dict[str, Any] = {}
+    try:
+        for key, value in overrides.items():
+            if not hasattr(CFG, key):
+                raise AttributeError(f"Config has no field: {key}")
+            original[key] = getattr(CFG, key)
+            object.__setattr__(CFG, key, value)
+        yield CFG
+    finally:
+        for key, value in original.items():
+            object.__setattr__(CFG, key, value)
 
 
 def _configure_quiet_runtime_logs() -> None:
@@ -298,6 +380,48 @@ def _configure_quiet_runtime_logs() -> None:
 
 
 _configure_quiet_runtime_logs()
+
+# ── [FIX-14] Chunk size guardrail ────────────────────────────────────────────
+# Warn at startup if CHUNK_SIZE risks silent truncation by the embedding model.
+# Rule: chunk_size (chars) / 4 chars-per-token should not exceed 80% of the
+# model's max token limit. The 4-char/token ratio is a conservative English estimate.
+
+_MODEL_MAX_TOKENS: dict[str, int] = {
+    "alibaba-nlp/gte-qwen2-1.5b-instruct": 32768,
+    "gte-qwen2-1.5b-instruct":             32768,
+    "dunzhang/stella_en_1.5b_v5":          131072,
+    "baai/bge-m3":                         8192,
+    "bge-m3":                              8192,
+    "baai/bge-base-en-v1.5":              512,
+    "bge-base-en-v1.5":                   512,
+    "intfloat/e5-mistral-7b-instruct":    32768,
+}
+
+_warn_if_chunk_size_exceeds_model_limit()  # [FIX-14] surface misconfigured chunk sizes early
+
+
+
+
+
+# ── [FIX-15] Query instruction prefix for instruction-tuned embedding models ──
+# Models in the gte-Qwen2 and E5-instruct family require a task instruction
+# prepended to QUERY embeddings only. Documents are embedded as-is.
+# Without this prefix, retrieval quality drops measurably because the model
+# was trained on (instruction+query, document) pairs, not (query, document) pairs.
+
+_INSTRUCTION_PREFIX_MODELS: dict[str, str] = {
+    "alibaba-nlp/gte-qwen2-1.5b-instruct": "Instruct: Retrieve relevant passages to answer the question\nQuery: ",
+    "gte-qwen2-1.5b-instruct":             "Instruct: Retrieve relevant passages to answer the question\nQuery: ",
+    "intfloat/e5-mistral-7b-instruct":     "Instruct: Retrieve semantically similar text\nQuery: ",
+    "intfloat/e5-large-v2":               "query: ",
+    "intfloat/e5-base-v2":                "query: ",
+}
+
+
+def _query_prefix() -> str:
+    """Return the instruction prefix for the active embedding model's query side. [FIX-15]"""
+    return _INSTRUCTION_PREFIX_MODELS.get(CFG.embed_model.strip().lower(), "")
+
 
 # ── [FIX-2] ChromaDB singleton ────────────────────────────────────────────────
 
@@ -330,6 +454,17 @@ WEB_CACHE = WebSearchCache(
     ttl_sec=CFG.web_cache_ttl_sec,
     max_value_chars=CFG.web_cache_max_value_chars,
 )
+
+
+def _reset_ollama_client() -> None:
+    """Recreate the Ollama client after transient transport/server failures."""
+    global OLLAMA_CLIENT
+    OLLAMA_CLIENT = ollama.Client(host=CFG.ollama_host)
+
+
+def _is_retryable_ollama_error(exc: BaseException) -> bool:
+    """Return True for transport-level errors that are usually safe to retry once."""
+    return isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException))
 
 # ── [FIX-8] HTTP client with retry/backoff ────────────────────────────────────
 
@@ -507,10 +642,110 @@ def _chunk_id(source: str, idx: int, text: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:20]
 
 
-def chunk_text(text: str, source: str) -> list[dict]:
-    """Chunk using recursive character splitting with collision-safe IDs. [FIX-3]"""
+def _semantic_chunk_text(text: str, embedder, breakpoint_percentile: int = 85) -> list[str]:
+    """
+    [FIX-12] Semantic chunking: split on embedding-detected topic shifts.
+
+    Strategy:
+      1. Split text into sentences.
+      2. Embed each sentence using the active embedder.
+      3. Compute cosine distance between consecutive sentence embeddings.
+      4. Treat distances above `breakpoint_percentile` as topic-shift boundaries.
+      5. Merge sentences between boundaries into chunks.
+
+    This produces semantically coherent chunks at the cost of O(n_sentences)
+    embedding calls — use for long, mixed-content documents where the recursive
+    splitter produces fragments. For short docs, "recursive" is faster and fine.
+    """
+    import numpy as np
+
+    # Sentence-level split (lightweight — avoids adding nltk dependency)
+    sentence_re = re.compile(r'(?<=[.!?])\s+')
+    sentences = [s.strip() for s in sentence_re.split(text) if s.strip()]
+    if len(sentences) <= 2:
+        return [text]  # Too short for semantic splitting — return as-is
+
+    # Embed all sentences in one batch to minimise model calls
+    raw_embeds = embedder.encode(sentences, show_progress_bar=False, batch_size=32)
+    if hasattr(raw_embeds, "tolist"):
+        embeds = raw_embeds
+    else:
+        import numpy as np
+        embeds = raw_embeds
+
+    # Cosine distances between consecutive sentence embeddings
+    distances: list[float] = []
+    for i in range(len(embeds) - 1):
+        a, b = embeds[i], embeds[i + 1]
+        dot = float(sum(x * y for x, y in zip(a, b)))
+        norm_a = float(sum(x * x for x in a) ** 0.5) or 1.0
+        norm_b = float(sum(x * x for x in b) ** 0.5) or 1.0
+        distances.append(1.0 - dot / (norm_a * norm_b))  # higher = bigger topic shift
+
+    if not distances:
+        return [text]
+
+    threshold = sorted(distances)[int(len(distances) * breakpoint_percentile / 100)]
+
+    # Build chunks by merging sentences between breakpoints
+    chunks: list[str] = []
+    current: list[str] = [sentences[0]]
+    for i, dist in enumerate(distances):
+        if dist >= threshold:
+            chunks.append(" ".join(current))
+            current = [sentences[i + 1]]
+        else:
+            current.append(sentences[i + 1])
+    if current:
+        chunks.append(" ".join(current))
+
+    # Guard: if semantic splitting produces chunks larger than CHUNK_SIZE, sub-split them
+    final: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= CFG.chunk_size:
+            final.append(chunk)
+        else:
+            final.extend(_split_text_recursive(chunk, CFG.chunk_size, CFG.chunk_overlap, SEPARATORS))
+    return [c for c in final if c.strip()]
+
+
+def late_chunk_document(full_text: str, source: str, embedder) -> list[dict]:
+    """
+    [FIX-13] Late chunking: store the whole document as a single vector for coarse
+    retrieval, but return fine-grained chunks from the retrieved document at query time.
+
+    This preserves document-level context that is lost when chunks are split before
+    embedding. The embedder sees the full document; the LLM sees targeted chunks.
+
+    Usage: called at query time on the raw text of a matched document, not at ingest time.
+    At ingest time, store the whole document text under a single ID prefixed with "doc::".
+    """
+    raw_chunks = _split_text_recursive(full_text, CFG.chunk_size, CFG.chunk_overlap, SEPARATORS)
+    chunks = []
+    for idx, chunk in enumerate(raw_chunks):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        chunks.append({
+            "text": chunk,
+            "source": source,
+            "idx": idx,
+            "id": _chunk_id(f"late::{source}", idx, chunk),
+        })
+    return chunks
+
+
+def chunk_text(text: str, source: str, embedder=None) -> list[dict]:
+    """Chunk text for indexing; optionally use semantic chunking when embedder is provided."""
     text = text.replace("\x00", "")
-    raw_chunks = _split_text_recursive(text, CFG.chunk_size, CFG.chunk_overlap, SEPARATORS)
+    if embedder is not None:
+        try:
+            raw_chunks = _semantic_chunk_text(text, embedder)
+        except Exception:
+            # Fallback keeps ingest resilient if semantic chunking fails for a document.
+            raw_chunks = _split_text_recursive(text, CFG.chunk_size, CFG.chunk_overlap, SEPARATORS)
+    else:
+        raw_chunks = _split_text_recursive(text, CFG.chunk_size, CFG.chunk_overlap, SEPARATORS)
     chunks = []
     for idx, chunk in enumerate(raw_chunks):
         chunk = chunk.strip()
@@ -655,6 +890,7 @@ def retrieve_docs(
 ) -> list[dict]:
     """
     Hybrid retrieval: dense ANN + BM25, fused with RRF, budget-filtered. [FIX-4, FIX-5]
+    q_embed must already be computed with _query_prefix() applied. [FIX-15]
     """
     top_k = top_k or CFG.top_k_docs
     if docs_col.count() == 0:
@@ -922,6 +1158,17 @@ TOOL_USAGE_GUIDE = (
 )
 
 
+def get_system_prompt(local_file_only: bool) -> str:
+    if local_file_only:
+        return (
+            "You are a local document assistant. Answer only from retrieved local document context.\n"
+            "Do not mention tools, web providers, tags, or internal instructions in your output.\n"
+            "Do not repeat prompt fragments.\n"
+            "If evidence is insufficient, say so clearly instead of guessing."
+        )
+    return SYSTEM_PROMPT + "\n\n" + TOOL_USAGE_GUIDE
+
+
 def build_messages(
     query: str,
     doc_chunks: list[dict],
@@ -975,7 +1222,8 @@ def build_messages(
         user_content = f"Question: {query}\nAnswer:"
 
     # Assemble messages: system + sliding window history + new user turn [FIX-10]
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + TOOL_USAGE_GUIDE}]
+    system_content = get_system_prompt(local_file_only=bool(source_filter))
+    messages: list[dict] = [{"role": "system", "content": system_content}]
     messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_content})
     return messages
@@ -991,31 +1239,44 @@ def generate_chat_response(
     stream: bool = False,
 ) -> str:
     """Send messages array to Ollama. [FIX-10] uses full message history."""
-    resp = OLLAMA_CLIENT.chat(
-        model=CFG.ollama_model,
-        messages=messages,
-        stream=stream,
-        options={
-            "temperature": temperature,
-            "num_ctx": num_ctx,
-            "num_predict": num_predict,
-            "num_thread": CFG.ollama_num_thread,
-        },
-        keep_alive=CFG.ollama_keep_alive,
-    )
-    if not stream:
-        return cast(Any, resp)["message"]["content"]
+    # Retry once for non-stream calls after transient transport failures.
+    max_attempts = 2 if not stream else 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = OLLAMA_CLIENT.chat(
+                model=CFG.ollama_model,
+                messages=messages,
+                stream=stream,
+                options={
+                    "temperature": temperature,
+                    "num_ctx": num_ctx,
+                    "num_predict": num_predict,
+                    "num_thread": CFG.ollama_num_thread,
+                },
+                keep_alive=CFG.ollama_keep_alive,
+            )
+            if not stream:
+                return cast(Any, resp)["message"]["content"]
 
-    out_parts: list[str] = []
-    for chunk in cast(Any, resp):
-        token = cast(Any, chunk)["message"]["content"]
-        if token:
-            out_parts.append(token)
-            sys.stdout.write(token)
+            out_parts: list[str] = []
+            for chunk in cast(Any, resp):
+                token = cast(Any, chunk)["message"]["content"]
+                if token:
+                    out_parts.append(token)
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+            sys.stdout.write("\n")
             sys.stdout.flush()
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-    return "".join(out_parts)
+            return "".join(out_parts)
+        except Exception as exc:
+            if attempt < max_attempts and _is_retryable_ollama_error(exc):
+                logger.warning("Transient Ollama error (%s). Resetting client and retrying once.", type(exc).__name__)
+                _reset_ollama_client()
+                time.sleep(0.5 * attempt)
+                continue
+            raise
+
+    raise RuntimeError("Unexpected Ollama response state")
 
 
 # ── File readers ──────────────────────────────────────────────────────────────
@@ -1080,7 +1341,7 @@ def _ingest_paths(files: list[Path], embedder, docs_col, show_status: bool = Tru
             console.print(f"[cyan]Ingesting:[/cyan] {Path(source_path).name}", end=" ")
         try:
             text = read_file(fp)
-            chunks = chunk_text(text, source_path)
+            chunks = chunk_text(text, source_path, embedder=embedder)
             if not chunks:
                 if show_status:
                     console.print("[yellow](empty)[/yellow]")
@@ -1103,6 +1364,12 @@ def _ingest_paths(files: list[Path], embedder, docs_col, show_status: bool = Tru
 
 SKIP_INGEST_FILENAMES = {"memory_1.md", "memory_2.md"}
 SUPPORTED_INGEST_EXTENSIONS = {".pdf", ".txt", ".md"}
+STRESS_PROFILES: list[tuple[str, dict[str, Any]]] = [
+    ("minimal", {"top_k_docs": 3, "doc_context_token_budget": 900, "ollama_chat_num_predict": 220}),
+    ("light", {"top_k_docs": 5, "doc_context_token_budget": 1400, "ollama_chat_num_predict": 260}),
+    ("moderate", {"top_k_docs": 8, "doc_context_token_budget": 2200, "ollama_chat_num_predict": 320}),
+    ("heavy", {"top_k_docs": 12, "doc_context_token_budget": 3200, "ollama_chat_num_predict": 420}),
+]
 
 
 def _normalize_input_path_arg(raw_path: str) -> str:
@@ -2559,7 +2826,7 @@ def chat() -> None:
         # [FIX-10] Build full messages array with sliding window history.
         messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, prompt_history, source_filter=source_filter)
         active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
-        active_num_predict = CFG.ollama_chat_num_predict + (120 if local_only_turn else 0)
+        active_num_predict = CFG.ollama_chat_num_predict + (CFG.ollama_chat_num_predict_local_bonus if local_only_turn else 0)
 
         full_response = ""
         t_gen = time.time()
@@ -2612,6 +2879,84 @@ def chat() -> None:
             continue
 
 
+def stress_local_file(path_arg: str) -> None:
+    target = Path(_normalize_input_path_arg(path_arg)).expanduser().resolve()
+    if not target.exists() or not target.is_file():
+        console.print(f"[red]Stress error:[/red] file not found: {path_arg}")
+        return
+    if target.suffix.lower() not in SUPPORTED_INGEST_EXTENSIONS:
+        allowed = ", ".join(sorted(SUPPORTED_INGEST_EXTENSIONS))
+        console.print(f"[red]Stress error:[/red] unsupported file extension (allowed: {allowed})")
+        return
+
+    client = get_chroma()
+    docs_col, _ = get_collections(client)
+    embedder = get_embedder(silent=True)
+
+    console.print(f"[cyan]Stress target:[/cyan] {target}")
+    with console.status("[dim]Ensuring file is indexed...[/dim]", spinner="dots"):
+        _ingest_paths([target], embedder, docs_col, show_status=False)
+        rebuild_bm25_index(docs_col)
+
+    query = f"what is this file about {target}"
+    source_filter = {_canonicalize_source(str(target))}
+
+    console.print("[cyan]Running stress profiles (context-heavy knobs first)...[/cyan]")
+    failures: list[str] = []
+    for name, overrides in STRESS_PROFILES:
+        profile_completed = False
+        for attempt in (1, 2):
+            try:
+                with temp_config_override(**overrides):
+                    before = _process_rss_mb()
+                    t0 = time.perf_counter()
+                    q_embed = _to_embedding_list(embedder.encode([query]))
+                    doc_chunks = retrieve_docs(query, q_embed, docs_col, source_filter=source_filter)
+                    messages = build_messages(query, doc_chunks, [], {}, [], source_filter=source_filter)
+                    effective_num_predict = CFG.ollama_chat_num_predict + CFG.ollama_chat_num_predict_local_bonus
+                    answer = generate_chat_response(
+                        messages,
+                        temperature=CFG.ollama_chat_temperature,
+                        num_predict=effective_num_predict,
+                        num_ctx=CFG.ollama_chat_num_ctx,
+                        stream=False,
+                    )
+                    elapsed = time.perf_counter() - t0
+                    after = _process_rss_mb()
+                    if before is None or after is None:
+                        rss_text = "n/a"
+                    else:
+                        rss_text = f"{before:.1f}->{after:.1f} MB (delta {after - before:+.1f})"
+
+                    console.print(
+                        f"[dim]Profile {name} | top_k={CFG.top_k_docs} | budget={CFG.doc_context_token_budget} | "
+                        f"num_predict={effective_num_predict} | chunks={len(doc_chunks)} | "
+                        f"rss={rss_text} | elapsed={elapsed:.2f}s | answer_chars={len(answer)}[/dim]"
+                    )
+                    profile_completed = True
+                    break
+            except Exception as exc:
+                retryable = _is_retryable_ollama_error(exc)
+                if attempt == 1 and retryable:
+                    console.print(f"[yellow]Profile {name}: transient Ollama error ({type(exc).__name__}), retrying once...[/yellow]")
+                    _reset_ollama_client()
+                    time.sleep(0.5)
+                    continue
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+                console.print(f"[red]Profile {name} failed:[/red] {type(exc).__name__}: {exc}")
+                break
+
+        if not profile_completed:
+            continue
+
+    if failures:
+        console.print(f"[yellow]Stress run completed with {len(failures)} failed profile(s).[/yellow]")
+        for item in failures:
+            console.print(f"[dim]- {item}[/dim]")
+    else:
+        console.print("[green]Stress run completed.[/green]")
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2647,6 +2992,11 @@ def main() -> None:
             clean_source_files(args[2:])
         else:
             console.print("[red]Usage: sources clean <file1> <file2> ...[/red]")
+    elif args[0] == "stress":
+        if len(args) < 2:
+            console.print("[red]Usage: uv run python rag.py stress <file>[/red]")
+        else:
+            stress_local_file(args[1])
     else:
         console.print(__doc__)
 

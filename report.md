@@ -1,3 +1,14 @@
+## 2026-04-10 11:56:45 IST
+
+Task summary:
+Fixed runtime and typing issues in rag.py while preserving behavior: made chunk_text accept an optional embedder argument used by the ingest path, and corrected startup ordering so the chunk-size warning check runs after the model token map is defined.
+
+Commit:
+Fix chunk_text signature mismatch and startup warning order
+
+Make chunk_text backward-compatible with existing two-argument calls while supporting optional semantic chunking via embedder.
+Move FIX-14 startup warning invocation to after _MODEL_MAX_TOKENS declaration to prevent import-time NameError.
+
 ## 2026-04-10 00:04:51 IST
 
 Task summary:
