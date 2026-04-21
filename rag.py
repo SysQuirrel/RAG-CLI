@@ -201,7 +201,7 @@ class Config:
 
     # ollama / generation
     # Controls model choice, latency, and output style for chat answers.
-    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "phi4-mini:latest"))  # Primary chat model used for responses.
+    ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "lfm2.5-thinking:latest"))  # Primary chat model used for responses.
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))  # Ollama server URL used for generation and embedding.
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
     ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))  # Context window for normal chat turns.
@@ -465,6 +465,17 @@ def _reset_ollama_client() -> None:
 def _is_retryable_ollama_error(exc: BaseException) -> bool:
     """Return True for transport-level errors that are usually safe to retry once."""
     return isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException))
+
+
+def _is_ollama_memory_pressure_error(exc: BaseException) -> bool:
+    """Return True when Ollama rejects a request due to insufficient system memory."""
+    msg = str(exc).lower()
+    return (
+        "requires more system memory" in msg
+        or "insufficient memory" in msg
+        or "not enough memory" in msg
+        or "out of memory" in msg
+    )
 
 # ── [FIX-8] HTTP client with retry/backoff ────────────────────────────────────
 
@@ -1239,42 +1250,54 @@ def generate_chat_response(
     stream: bool = False,
 ) -> str:
     """Send messages array to Ollama. [FIX-10] uses full message history."""
-    # Retry once for non-stream calls after transient transport failures.
+    # Retry once after transient transport failures.
     max_attempts = 2 if not stream else 1
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = OLLAMA_CLIENT.chat(
-                model=CFG.ollama_model,
-                messages=messages,
-                stream=stream,
-                options={
-                    "temperature": temperature,
-                    "num_ctx": num_ctx,
-                    "num_predict": num_predict,
-                    "num_thread": CFG.ollama_num_thread,
-                },
-                keep_alive=CFG.ollama_keep_alive,
-            )
-            if not stream:
-                return cast(Any, resp)["message"]["content"]
 
-            out_parts: list[str] = []
-            for chunk in cast(Any, resp):
-                token = cast(Any, chunk)["message"]["content"]
-                if token:
-                    out_parts.append(token)
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            return "".join(out_parts)
-        except Exception as exc:
-            if attempt < max_attempts and _is_retryable_ollama_error(exc):
-                logger.warning("Transient Ollama error (%s). Resetting client and retrying once.", type(exc).__name__)
-                _reset_ollama_client()
-                time.sleep(0.5 * attempt)
-                continue
-            raise
+    # On memory-pressure failures, progressively shrink num_ctx.
+    ctx_candidates = [max(1024, int(num_ctx))]
+    for candidate in (CFG.ollama_chat_num_ctx_web, num_ctx // 2, 4096, 3072, 2048, 1024):
+        c = max(1024, int(candidate))
+        if c not in ctx_candidates and c < ctx_candidates[0]:
+            ctx_candidates.append(c)
+
+    for ctx in ctx_candidates:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = OLLAMA_CLIENT.chat(
+                    model=CFG.ollama_model,
+                    messages=messages,
+                    stream=stream,
+                    options={
+                        "temperature": temperature,
+                        "num_ctx": ctx,
+                        "num_predict": num_predict,
+                        "num_thread": CFG.ollama_num_thread,
+                    },
+                    keep_alive=CFG.ollama_keep_alive,
+                )
+                if not stream:
+                    return cast(Any, resp)["message"]["content"]
+
+                out_parts: list[str] = []
+                for chunk in cast(Any, resp):
+                    token = cast(Any, chunk)["message"]["content"]
+                    if token:
+                        out_parts.append(token)
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(out_parts)
+            except Exception as exc:
+                if attempt < max_attempts and _is_retryable_ollama_error(exc):
+                    logger.warning("Transient Ollama error (%s). Resetting client and retrying once.", type(exc).__name__)
+                    _reset_ollama_client()
+                    time.sleep(0.5 * attempt)
+                    continue
+                if _is_ollama_memory_pressure_error(exc) and ctx != ctx_candidates[-1]:
+                    logger.warning("Ollama memory pressure at num_ctx=%s; retrying with smaller context.", ctx)
+                    break
+                raise
 
     raise RuntimeError("Unexpected Ollama response state")
 
