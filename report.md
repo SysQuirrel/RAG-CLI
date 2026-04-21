@@ -1,3 +1,23 @@
+## 2026-04-21 22:38:38 IST
+
+Task summary:
+Reduced perceived chat latency by changing rag.py to avoid unnecessary dense retrieval and oversized generation budgets. Added sparse-first retrieval helpers, a no-BM25 skip-dense policy for low-complexity non-local turns, optional docs_count hints in retrieval cache keys, adaptive per-turn num_ctx/num_predict selection, and lower low-context generation caps. Updated benchmark_rag.py to match current helper signatures and to report sparse/dense simulation plus fixed-vs-adaptive generation latency.
+
+Commit:
+Optimize retrieval routing and adaptive generation budgets for faster chat turns
+
+Introduce sparse-first/no-BM25 skip-dense gates so low-complexity turns can bypass expensive dense embedding/retrieval.
+Add adaptive num_ctx and num_predict selection tied to intent, evidence, and prompt size to reduce generation latency while preserving higher budgets for reasoning/local-file turns.
+Update benchmark script to reflect current APIs and print retrieval-stage simulation plus fixed-vs-adaptive generation timings.
+
+## 2026-04-21 22:04:19 IST
+
+Task summary:
+Implemented adaptive latency and correctness optimizations in rag.py: added intent-based two-stage retrieval (Stage A fast pass with evidence scoring and Stage B escalation), introduced per-turn query-embedding and retrieval caches, enforced cache invalidation on index mutations, and added per-turn telemetry that reports route/tools/retrieval/prompt/generation timings. Also kept local-file safety guarantees and integrated adaptive memory/web fallback decisions by intent.
+
+Commit:
+Uncommitted (git repository not detected in this directory)
+
 ## 2026-04-10 11:56:45 IST
 
 Task summary:

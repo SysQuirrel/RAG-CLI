@@ -80,6 +80,7 @@ import re
 import gc
 import threading
 import logging
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -898,6 +899,7 @@ def retrieve_docs(
     docs_col,
     top_k: int | None = None,
     source_filter: set[str] | None = None,
+    budget_tokens: int | None = None,
 ) -> list[dict]:
     """
     Hybrid retrieval: dense ANN + BM25, fused with RRF, budget-filtered. [FIX-4, FIX-5]
@@ -966,7 +968,8 @@ def retrieve_docs(
 
     # 4. Apply token budget [FIX-5]
     top = fused[:top_k]
-    return _select_chunks_within_budget(top, CFG.doc_context_token_budget)
+    active_budget = int(budget_tokens) if isinstance(budget_tokens, int) and budget_tokens > 0 else CFG.doc_context_token_budget
+    return _select_chunks_within_budget(top, active_budget)
 
 
 def retrieve_memory(query: str, embedder, memory_col, q_embed: list | None = None) -> list[dict]:
@@ -1394,6 +1397,306 @@ STRESS_PROFILES: list[tuple[str, dict[str, Any]]] = [
     ("heavy", {"top_k_docs": 12, "doc_context_token_budget": 3200, "ollama_chat_num_predict": 420}),
 ]
 
+# Turn-level caches to avoid repeated expensive retrieval/embedding work.
+_QUERY_EMBED_CACHE: "OrderedDict[str, list]" = OrderedDict()
+_DOC_RETRIEVE_CACHE: "OrderedDict[tuple, list[dict]]" = OrderedDict()
+_MAX_QUERY_EMBED_CACHE = 256
+_MAX_DOC_RETRIEVE_CACHE = 256
+
+
+def _normalize_query_for_cache(query: str) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+def _cache_put(cache: "OrderedDict[Any, Any]", key: Any, value: Any, max_items: int) -> None:
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = value
+    while len(cache) > max_items:
+        cache.popitem(last=False)
+
+
+def _clear_turn_caches() -> None:
+    _QUERY_EMBED_CACHE.clear()
+    _DOC_RETRIEVE_CACHE.clear()
+
+
+def _get_query_embedding_cached(query: str, embedder) -> list:
+    key = _normalize_query_for_cache(query)
+    cached = _QUERY_EMBED_CACHE.get(key)
+    if cached is not None:
+        _QUERY_EMBED_CACHE.move_to_end(key)
+        return cached
+    q_embed = _to_embedding_list(embedder.encode([query]))
+    _cache_put(_QUERY_EMBED_CACHE, key, q_embed, _MAX_QUERY_EMBED_CACHE)
+    return q_embed
+
+
+def _query_complexity_score(query: str) -> float:
+    q = (query or "").strip().lower()
+    words = q.split()
+    long_question = 1.0 if len(words) >= 18 else (0.5 if len(words) >= 10 else 0.0)
+    reasoning_markers = [
+        "why", "explain", "compare", "tradeoff", "architecture", "analyze", "reason", "derive",
+        "step by step", "pros and cons", "optimize", "design", "bottleneck",
+    ]
+    marker_score = 1.0 if any(m in q for m in reasoning_markers) else 0.0
+    punctuation_score = 0.4 if "?" in q else 0.0
+    return min(1.0, 0.5 * long_question + 0.35 * marker_score + 0.15 * punctuation_score)
+
+
+def _classify_query_intent(query: str, local_only_turn: bool) -> str:
+    if local_only_turn:
+        return "local_file"
+    hit_weather, _ = _should_weather(query)
+    hit_cve, _ = _should_cve(query)
+    hit_dns, _ = _should_dns(query)
+    if hit_weather or hit_cve or hit_dns:
+        return "tool_factual"
+    q = (query or "").lower()
+    if any(tok in q for tok in ["latest", "today", "recent", "news", "2024", "2025", "2026", "update", "release"]):
+        return "current_events"
+    if _query_complexity_score(query) >= 0.55:
+        return "reasoning"
+    if len(q.split()) <= 5:
+        return "factual"
+    return "knowledge"
+
+
+def _build_turn_profile(query: str, local_only_turn: bool) -> dict[str, Any]:
+    intent = _classify_query_intent(query, local_only_turn)
+    profile: dict[str, Any] = {
+        "intent": intent,
+        "stage_a_top_k": 3,
+        "stage_a_budget": 1000,
+        "stage_b_top_k": 6,
+        "stage_b_budget": 2200,
+        "evidence_threshold": 0.55,
+        "use_memory": False,
+        "allow_web_fallback": True,
+        "ctx_bonus": 0,
+        "predict_bonus": 0,
+    }
+
+    if intent == "local_file":
+        profile.update({
+            "stage_a_top_k": 3,
+            "stage_a_budget": 1200,
+            "stage_b_top_k": 7,
+            "stage_b_budget": 3000,
+            "evidence_threshold": 0.58,
+            "use_memory": False,
+            "allow_web_fallback": False,
+            "ctx_bonus": 1024,
+            "predict_bonus": CFG.ollama_chat_num_predict_local_bonus,
+        })
+    elif intent == "tool_factual":
+        profile.update({
+            "stage_a_top_k": 2,
+            "stage_a_budget": 700,
+            "stage_b_top_k": 4,
+            "stage_b_budget": 1400,
+            "evidence_threshold": 0.64,
+            "use_memory": False,
+            "allow_web_fallback": False,
+            "predict_bonus": -40,
+        })
+    elif intent == "current_events":
+        profile.update({
+            "stage_a_top_k": 2,
+            "stage_a_budget": 800,
+            "stage_b_top_k": 5,
+            "stage_b_budget": 1400,
+            "evidence_threshold": 0.66,
+            "use_memory": False,
+            "allow_web_fallback": True,
+            "predict_bonus": -20,
+        })
+    elif intent == "factual":
+        profile.update({
+            "stage_a_top_k": 2,
+            "stage_a_budget": 700,
+            "stage_b_top_k": 4,
+            "stage_b_budget": 1200,
+            "evidence_threshold": 0.62,
+            "use_memory": False,
+            "predict_bonus": -30,
+        })
+    elif intent == "reasoning":
+        profile.update({
+            "stage_a_top_k": 4,
+            "stage_a_budget": 1400,
+            "stage_b_top_k": 9,
+            "stage_b_budget": 3200,
+            "evidence_threshold": 0.50,
+            "use_memory": True,
+            "ctx_bonus": 2048,
+            "predict_bonus": 80,
+        })
+
+    return profile
+
+
+def _estimate_doc_evidence(chunks: list[dict]) -> float:
+    if not chunks:
+        return 0.0
+    scores = [float(c.get("score", 0.0)) for c in chunks]
+    max_score = max(scores) if scores else 0.0
+    avg_score = (sum(scores) / len(scores)) if scores else 0.0
+    src_count = len({str(c.get("source", "")).strip() for c in chunks if c.get("source")})
+    source_diversity = min(1.0, src_count / 3.0)
+    chunk_count = min(1.0, len(chunks) / 4.0)
+    return max(0.0, min(1.0, (0.45 * max_score) + (0.30 * avg_score) + (0.15 * source_diversity) + (0.10 * chunk_count)))
+
+
+def _should_force_stage_b(query: str, intent: str, evidence: float, threshold: float) -> bool:
+    if evidence < threshold:
+        return True
+    if intent in {"reasoning", "local_file"} and _query_complexity_score(query) >= 0.55 and evidence < min(0.72, threshold + 0.12):
+        return True
+    return False
+
+
+def _choose_num_ctx(
+    messages: list[dict],
+    turn_profile: dict[str, Any],
+    *,
+    has_web_results: bool,
+    retrieval_evidence: float,
+) -> int:
+    """Pick a context window sized to this turn instead of always using max context."""
+    intent = str(turn_profile.get("intent", "knowledge"))
+    base_ctx = CFG.ollama_chat_num_ctx_web if has_web_results else CFG.ollama_chat_num_ctx
+    base_ctx = max(1024, int(base_ctx) + int(turn_profile.get("ctx_bonus", 0)))
+
+    prompt_tokens = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            prompt_tokens += _approx_tokens(str(msg.get("content", "")))
+
+    predict_hint = max(96, CFG.ollama_chat_num_predict + int(turn_profile.get("predict_bonus", 0)))
+    target_ctx = int((prompt_tokens + predict_hint + 320) * 1.35)
+
+    if intent in {"tool_factual", "factual", "current_events"}:
+        floor, cap = 1024, 4096
+    elif intent == "reasoning":
+        floor, cap = 3072, 8192
+    elif intent == "local_file":
+        floor, cap = 3072, 12288
+    else:
+        floor, cap = 1536, 6144
+
+    if retrieval_evidence < 0.20 and intent in {"knowledge", "factual", "tool_factual"}:
+        cap = min(cap, 2048)
+
+    upper_bound = max(floor, min(base_ctx, cap))
+    return max(1024, min(upper_bound, max(floor, target_ctx)))
+
+
+def _choose_num_predict(query: str, turn_profile: dict[str, Any], *, has_docs: bool, has_web_results: bool) -> int:
+    """Reduce output budget on low-context turns; keep room for complex grounded answers."""
+    intent = str(turn_profile.get("intent", "knowledge"))
+    base_predict = max(64, CFG.ollama_chat_num_predict + int(turn_profile.get("predict_bonus", 0)))
+
+    if intent in {"tool_factual", "factual", "current_events"}:
+        cap = 110
+    elif intent == "reasoning":
+        cap = 320
+    elif intent == "local_file":
+        cap = max(200, CFG.ollama_chat_num_predict + CFG.ollama_chat_num_predict_local_bonus)
+    else:
+        cap = 220
+
+    if not has_docs and not has_web_results and _query_complexity_score(query) < 0.35:
+        cap = min(cap, 96)
+
+    return max(64, min(base_predict, cap))
+
+
+def _retrieve_docs_cached(
+    query: str,
+    q_embed: list,
+    docs_col,
+    top_k: int,
+    budget_tokens: int,
+    source_filter: set[str] | None,
+    docs_count_hint: int | None = None,
+) -> list[dict]:
+    normalized_query = _normalize_query_for_cache(query)
+    docs_count = int(docs_count_hint) if isinstance(docs_count_hint, int) and docs_count_hint >= 0 else int(docs_col.count())
+    cache_key = (
+        normalized_query,
+        int(top_k),
+        int(budget_tokens),
+        tuple(sorted(source_filter or set())),
+        docs_count,
+    )
+    cached = _DOC_RETRIEVE_CACHE.get(cache_key)
+    if cached is not None:
+        _DOC_RETRIEVE_CACHE.move_to_end(cache_key)
+        return [dict(item) for item in cached]
+    retrieved = retrieve_docs(
+        query,
+        q_embed,
+        docs_col,
+        top_k=top_k,
+        source_filter=source_filter,
+        budget_tokens=budget_tokens,
+    )
+    _cache_put(_DOC_RETRIEVE_CACHE, cache_key, [dict(item) for item in retrieved], _MAX_DOC_RETRIEVE_CACHE)
+    return retrieved
+
+
+def _retrieve_docs_sparse_probe(
+    query: str,
+    top_k: int,
+    budget_tokens: int,
+    source_filter: set[str] | None,
+) -> list[dict]:
+    """Fast lexical probe that avoids dense query embedding on low-evidence turns."""
+    if not HAS_BM25 or _BM25_INDEX._bm25 is None:
+        return []
+
+    ranked = _BM25_INDEX.query(query, top_k=max(1, top_k * 3))
+    if not ranked:
+        return []
+
+    allowed_sources = {s for s in (source_filter or set()) if s}
+    picked: list[dict] = []
+    for corpus_idx, bm25_score in ranked:
+        if corpus_idx >= len(_BM25_INDEX._corpus_texts):
+            continue
+        text = _BM25_INDEX._corpus_texts[corpus_idx]
+        meta = _BM25_INDEX._corpus_metas[corpus_idx] if corpus_idx < len(_BM25_INDEX._corpus_metas) else {}
+        source = _canonicalize_source(meta.get("source", "?") if isinstance(meta, dict) else "?")
+        if allowed_sources and source not in allowed_sources:
+            continue
+        if CFG.drop_suspicious_chunks and looks_like_prompt_injection(text):
+            continue
+        score = float(bm25_score)
+        if score < max(0.06, CFG.doc_min_score * 0.55):
+            continue
+        picked.append({"text": sanitize_context_text(text), "source": source, "score": score})
+        if len(picked) >= max(1, top_k):
+            break
+
+    if not picked:
+        return []
+    picked.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
+    return _select_chunks_within_budget(picked, max(200, int(budget_tokens)))
+
+
+def _should_try_sparse_first(query: str, intent: str, local_only_turn: bool, docs_count: int) -> bool:
+    """Decide whether a sparse-only first pass is safe before dense retrieval."""
+    if docs_count <= 0 or not HAS_BM25 or _BM25_INDEX._bm25 is None:
+        return False
+    if local_only_turn:
+        return True
+    if intent in {"current_events", "tool_factual", "factual", "knowledge"}:
+        return True
+    # For complex reasoning queries, still try sparse first to cheaply validate lexical matches.
+    return _query_complexity_score(query) < 0.82
+
 
 def _normalize_input_path_arg(raw_path: str) -> str:
     """Normalize path args and tolerate accidental quote wrapping."""
@@ -1477,6 +1780,7 @@ def ingest(paths: list[str]) -> None:
 
     # [FIX-4] Rebuild BM25 index after ingestion
     rebuild_bm25_index(docs_col)
+    _clear_turn_caches()
 
     docs_after = docs_col.count()
     unique_chunks_added = max(0, docs_after - docs_before)
@@ -2549,6 +2853,7 @@ def docs_list() -> None:
 
 def docs_clear() -> None:
     get_chroma().delete_collection("documents")
+    _clear_turn_caches()
     console.print("[green]Document index cleared.[/green]")
 
 
@@ -2577,6 +2882,7 @@ def docs_prune() -> None:
         console.print("[green]No suspicious document chunks found.[/green]")
         return
     docs_col.delete(ids=bad_ids)
+    _clear_turn_caches()
     console.print(f"[green]Docs pruned.[/green] Removed {len(bad_ids)} chunks from {len(touched_files)} file(s).")
 
 
@@ -2659,6 +2965,8 @@ def chat() -> None:
 
     # Main REPL loop: read user input, interpret commands, then send queries to the model.
     while True:
+        turn_started = time.perf_counter()
+        timing: dict[str, float] = {}
         try:
             query = Prompt.ask("\n[bold blue]You[/bold blue]").strip()
         except (KeyboardInterrupt, EOFError):
@@ -2675,6 +2983,7 @@ def chat() -> None:
             continue
 
         # Parse an optional leading slash command (e.g. /web, /weather) from the input.
+        t_route = time.perf_counter()
         cmd, arg, cleaned_query = _parse_command(query)
 
         if query.strip().startswith("/") and not cmd:
@@ -2714,12 +3023,15 @@ def chat() -> None:
         referenced_files = _extract_local_file_refs(cleaned_query)
         source_filter: set[str] = {_canonicalize_source(str(path)) for path in referenced_files}
         local_only_turn = bool(source_filter)
+        turn_profile = _build_turn_profile(cleaned_query, local_only_turn)
+        timing["route_ms"] = (time.perf_counter() - t_route) * 1000
 
         # Tool execution
         tool_results: dict[str, str] = {}
         web_only_mode = False
 
         # If the user issued an explicit command, run the corresponding tool(s) first.
+        t_tools = time.perf_counter()
         if cmd:
             if cmd != "help" and _is_help_arg(arg):
                 console.print(_command_usage_line(cmd))
@@ -2790,6 +3102,7 @@ def chat() -> None:
                     tool_results["DNS Recon"] = tool_dns(tool_arg)
                 elif tool_name == "fetch":
                     tool_results["Fetched page"] = tool_fetch_url(tool_arg)
+            timing["tools_ms"] = (time.perf_counter() - t_tools) * 1000
 
         # Auto-index referenced local files and constrain this turn's retrieval to them.
         if referenced_files:
@@ -2798,22 +3111,107 @@ def chat() -> None:
                 embedder = get_embedder()
                 _ingest_paths(referenced_files, embedder, docs_col, show_status=False)
                 rebuild_bm25_index(docs_col)
+                _clear_turn_caches()
         route_label = "local_only" if local_only_turn else ("web_only" if web_only_mode else "hybrid_or_chat")
         console.print(
             f"[dim]Route: {route_label} | local_refs={len(referenced_files)} | "
-            f"web_allowed={not local_only_turn} | memory_allowed={not local_only_turn}[/dim]"
+            f"web_allowed={not local_only_turn} | memory_allowed={turn_profile['use_memory'] and not local_only_turn} | intent={turn_profile['intent']}[/dim]"
         )
 
         # [FIX-4] Retrieve: hybrid BM25 + dense for local docs + semantic memory.
+        turn_embedder = None
+        retrieval_stage = "none"
+        retrieval_evidence = 0.0
+        escalated = False
+        t_retrieve = time.perf_counter()
         if web_only_mode:
             doc_chunks = []
             mem_turns = []
         else:
             with console.status("[dim]Retrieving context...[/dim]", spinner="dots"):
-                embedder = get_embedder()
-                q_embed = _to_embedding_list(embedder.encode([cleaned_query]))
-                doc_chunks = retrieve_docs(cleaned_query, q_embed, docs_col, source_filter=source_filter)
-                mem_turns = [] if local_only_turn else retrieve_memory(cleaned_query, embedder, memory_col, q_embed=q_embed)
+                docs_count = docs_col.count()
+                intent = str(turn_profile.get("intent", "knowledge"))
+                sparse_first = _should_try_sparse_first(cleaned_query, intent, local_only_turn, docs_count)
+                skip_dense_without_sparse = (
+                    (not sparse_first)
+                    and (not local_only_turn)
+                    and (not bool(turn_profile["use_memory"]))
+                    and intent in {"factual", "knowledge", "tool_factual", "current_events"}
+                    and _query_complexity_score(cleaned_query) < 0.60
+                )
+
+                doc_chunks = []
+                if sparse_first:
+                    doc_chunks = _retrieve_docs_sparse_probe(
+                        cleaned_query,
+                        top_k=turn_profile["stage_a_top_k"],
+                        budget_tokens=turn_profile["stage_a_budget"],
+                        source_filter=source_filter,
+                    )
+                    retrieval_stage = "A-sparse"
+                    retrieval_evidence = _estimate_doc_evidence(doc_chunks)
+                elif skip_dense_without_sparse:
+                    retrieval_stage = "skip-dense"
+                    retrieval_evidence = 0.0
+
+                should_escalate = _should_force_stage_b(
+                    cleaned_query,
+                    intent=intent,
+                    evidence=retrieval_evidence,
+                    threshold=turn_profile["evidence_threshold"],
+                )
+                if skip_dense_without_sparse:
+                    should_escalate = False
+                use_memory = bool(turn_profile["use_memory"]) and not local_only_turn
+                need_dense = ((not sparse_first) and (not skip_dense_without_sparse)) or should_escalate or use_memory or local_only_turn
+
+                q_embed = None
+                if need_dense:
+                    turn_embedder = get_embedder()
+                    q_embed = _get_query_embedding_cached(cleaned_query, turn_embedder)
+                    dense_stage_a_docs = _retrieve_docs_cached(
+                        cleaned_query,
+                        q_embed,
+                        docs_col,
+                        top_k=turn_profile["stage_a_top_k"],
+                        budget_tokens=turn_profile["stage_a_budget"],
+                        source_filter=source_filter,
+                        docs_count_hint=docs_count,
+                    )
+                    dense_stage_a_evidence = _estimate_doc_evidence(dense_stage_a_docs)
+                    if dense_stage_a_evidence >= retrieval_evidence or len(dense_stage_a_docs) > len(doc_chunks):
+                        doc_chunks = dense_stage_a_docs
+                        retrieval_evidence = dense_stage_a_evidence
+                        retrieval_stage = "A-dense"
+
+                    should_escalate = _should_force_stage_b(
+                        cleaned_query,
+                        intent=intent,
+                        evidence=retrieval_evidence,
+                        threshold=turn_profile["evidence_threshold"],
+                    )
+                    if should_escalate:
+                        escalated = True
+                        stage_b_docs = _retrieve_docs_cached(
+                            cleaned_query,
+                            q_embed,
+                            docs_col,
+                            top_k=turn_profile["stage_b_top_k"],
+                            budget_tokens=turn_profile["stage_b_budget"],
+                            source_filter=source_filter,
+                            docs_count_hint=docs_count,
+                        )
+                        stage_b_evidence = _estimate_doc_evidence(stage_b_docs)
+                        if stage_b_evidence >= retrieval_evidence or len(stage_b_docs) > len(doc_chunks):
+                            doc_chunks = stage_b_docs
+                            retrieval_evidence = stage_b_evidence
+                            retrieval_stage = "B-dense"
+
+                if use_memory and turn_embedder is not None and q_embed is not None:
+                    mem_turns = retrieve_memory(cleaned_query, turn_embedder, memory_col, q_embed=q_embed)
+                else:
+                    mem_turns = []
+        timing["retrieve_ms"] = (time.perf_counter() - t_retrieve) * 1000
 
         prompt_history = [] if local_only_turn else conversation_history
 
@@ -2823,10 +3221,11 @@ def chat() -> None:
             and _any_web_provider_available()
             and not cmd
             and not local_only_turn
+            and bool(turn_profile["allow_web_fallback"])
             and "Web search" not in tool_results
             and _should_web_search(cleaned_query)
             and len(cleaned_query.split()) >= max(1, CFG.auto_web_min_query_words)
-            and len(doc_chunks) == 0
+            and (len(doc_chunks) == 0 or retrieval_evidence < (turn_profile["evidence_threshold"] * 0.70))
         ):
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):
                 compact = _run_web_lookup(cleaned_query, interactive=False)
@@ -2845,14 +3244,31 @@ def chat() -> None:
             console.print(f"[dim]Memory turns: {len(mem_turns)}[/dim]")
         if tool_results:
             console.print(f"[dim]Tools: {list(tool_results.keys())}[/dim]")
+        if not web_only_mode:
+            console.print(
+                f"[dim]Retrieval: stage={retrieval_stage} | escalated={escalated} | "
+                f"evidence={retrieval_evidence:.2f} | docs={len(doc_chunks)}[/dim]"
+            )
 
         # [FIX-10] Build full messages array with sliding window history.
+        t_prompt = time.perf_counter()
         messages = build_messages(cleaned_query, doc_chunks, mem_turns, tool_results, prompt_history, source_filter=source_filter)
-        active_num_ctx = CFG.ollama_chat_num_ctx_web if "Web search" in tool_results else CFG.ollama_chat_num_ctx
-        active_num_predict = CFG.ollama_chat_num_predict + (CFG.ollama_chat_num_predict_local_bonus if local_only_turn else 0)
+        timing["prompt_ms"] = (time.perf_counter() - t_prompt) * 1000
+        active_num_ctx = _choose_num_ctx(
+            messages,
+            turn_profile,
+            has_web_results="Web search" in tool_results,
+            retrieval_evidence=retrieval_evidence,
+        )
+        active_num_predict = _choose_num_predict(
+            cleaned_query,
+            turn_profile,
+            has_docs=bool(doc_chunks),
+            has_web_results="Web search" in tool_results,
+        )
 
         full_response = ""
-        t_gen = time.time()
+        t_gen = time.perf_counter()
         try:
             # Stream the main answer tokens so output appears gradually instead of all at once.
             console.print("Assistant: ", end="")
@@ -2879,8 +3295,20 @@ def chat() -> None:
                 conversation_history.append({"role": "assistant", "content": _history_text(full_response)})
             conversation_history = conversation_history[-(CFG.conversation_window * 2):]
 
-            gen_time = time.time() - t_gen
+            gen_time = time.perf_counter() - t_gen
+            timing["gen_ms"] = gen_time * 1000
+            timing["total_ms"] = (time.perf_counter() - turn_started) * 1000
             console.print(f"[dim]Generation time: {gen_time:.1f}s[/dim]")
+            console.print(
+                f"[dim]Generation budget: num_ctx={active_num_ctx} | num_predict={active_num_predict}[/dim]"
+            )
+            console.print(
+                "[dim]Turn perf: "
+                f"total={timing.get('total_ms', 0.0):.0f}ms | "
+                f"route={timing.get('route_ms', 0.0):.0f} | tools={timing.get('tools_ms', 0.0):.0f} | "
+                f"retrieve={timing.get('retrieve_ms', 0.0):.0f} | prompt={timing.get('prompt_ms', 0.0):.0f} | "
+                f"gen={timing.get('gen_ms', 0.0):.0f}[/dim]"
+            )
             if monitor.enabled:
                 console.print(f"[dim]{monitor.turn_summary_line()}[/dim]")
                 monitor.reset_peaks()
@@ -2892,7 +3320,9 @@ def chat() -> None:
             )
             # [FIX-7] Memory deduplication happens inside save_memory
             if not local_only_turn:
-                save_memory(query, full_response, get_embedder(), memory_col)
+                if turn_embedder is None:
+                    turn_embedder = get_embedder(silent=True)
+                save_memory(query, full_response, turn_embedder, memory_col)
             turn_count += 1
             maybe_release_ram(turn_count)
 
