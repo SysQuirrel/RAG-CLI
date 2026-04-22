@@ -1,3 +1,15 @@
+## 2026-04-22 14:16:33 IST
+
+Task summary:
+Implemented a latency-focused runtime profile by updating .env to use a faster non-thinking chat model and tighter generation budgets. Disabled visible thinking stream and reduced chat context/output limits to lower end-to-end answer time on simple turns while preserving grounded behavior.
+
+Commit:
+Tune runtime profile for faster answer generation
+
+Set OLLAMA_MODEL to a faster non-thinking model for normal chat latency.
+Disable thinking stream rendering and reduce OLLAMA_CHAT_NUM_CTX, OLLAMA_CHAT_NUM_CTX_WEB, OLLAMA_CHAT_NUM_PREDICT, and local bonus defaults.
+Keep changes configuration-only so behavior can be reverted or tuned quickly through .env.
+
 ## 2026-04-22 14:06:55 IST
 
 Task summary:
