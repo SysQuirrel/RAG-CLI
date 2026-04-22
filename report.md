@@ -1,3 +1,15 @@
+## 2026-04-22 14:06:55 IST
+
+Task summary:
+Restored visible reasoning output for thinking-capable Ollama models in chat streaming. Added a dedicated OLLAMA_SHOW_THINKING config flag (default true), parsed message.thinking tokens from stream chunks, and displayed a clear thinking/answer split while keeping stored assistant memory/export text limited to final answer content.
+
+Commit:
+Show model thinking stream in chat output
+
+Add OLLAMA_SHOW_THINKING config to control visibility of reasoning tokens in streamed responses.
+Parse and print message.thinking chunks when available, then switch back to an explicit answer section for final content.
+Keep non-stream logic and stored assistant text grounded to final answer content to avoid polluting memory/history.
+
 ## 2026-04-21 22:38:38 IST
 
 Task summary:

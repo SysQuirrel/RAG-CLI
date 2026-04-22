@@ -210,6 +210,7 @@ class Config:
     ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))  # Max tokens to generate per reply.
     ollama_chat_num_predict_local_bonus: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT_LOCAL_BONUS", 220))  # Extra generation budget for local-file turns.
     ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))  # Randomness level for answer style.
+    ollama_show_thinking: bool = field(default_factory=lambda: _env_bool("OLLAMA_SHOW_THINKING", True))  # Show model reasoning stream when available.
     ollama_keep_alive: str = "10m"  # Keep the model warm between turns to reduce reload latency.
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))  # CPU threads reserved for Ollama inference.
 
@@ -1250,11 +1251,65 @@ def generate_chat_response(
     temperature: float,
     num_predict: int,
     num_ctx: int,
+    show_thinking: bool,
     stream: bool = False,
 ) -> str:
     """Send messages array to Ollama. [FIX-10] uses full message history."""
+    def _resp_field(resp_obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(resp_obj, dict):
+            return resp_obj.get(key, default)
+        return getattr(resp_obj, key, default)
+
+    def _resp_message_content(resp_obj: Any) -> str:
+        msg = _resp_field(resp_obj, "message", {})
+        if isinstance(msg, dict):
+            return str(msg.get("content", "") or "")
+        return str(getattr(msg, "content", "") or "")
+
+    def _resp_message_thinking(resp_obj: Any) -> str:
+        msg = _resp_field(resp_obj, "message", {})
+        if isinstance(msg, dict):
+            return str(msg.get("thinking", "") or "")
+        return str(getattr(msg, "thinking", "") or "")
+
+    def _request_once(request_stream: bool, request_num_predict: int, request_ctx: int) -> Any:
+        return OLLAMA_CLIENT.chat(
+            model=CFG.ollama_model,
+            messages=messages,
+            stream=request_stream,
+            options={
+                "temperature": temperature,
+                "num_ctx": request_ctx,
+                "num_predict": request_num_predict,
+                "num_thread": CFG.ollama_num_thread,
+            },
+            keep_alive=CFG.ollama_keep_alive,
+        )
+
+    def _recover_if_empty_content(initial_text: str, ctx: int, base_predict: int) -> str:
+        if initial_text.strip():
+            return initial_text
+        # Thinking models can consume the budget before emitting final content.
+        escalations = [max(256, int(base_predict) * 2), 384, 640]
+        tried: set[int] = set()
+        for boosted_predict in escalations:
+            if boosted_predict in tried or boosted_predict <= int(base_predict):
+                continue
+            tried.add(boosted_predict)
+            try:
+                retry_resp = _request_once(False, boosted_predict, ctx)
+                recovered = _resp_message_content(retry_resp)
+                if recovered.strip():
+                    return recovered
+            except Exception:
+                continue
+        return initial_text
+
     # Retry once after transient transport failures.
     max_attempts = 2 if not stream else 1
+    effective_num_predict = int(num_predict)
+    if "thinking" in CFG.ollama_model.lower():
+        effective_num_predict = max(384, effective_num_predict)
 
     # On memory-pressure failures, progressively shrink num_ctx.
     ctx_candidates = [max(1024, int(num_ctx))]
@@ -1266,31 +1321,41 @@ def generate_chat_response(
     for ctx in ctx_candidates:
         for attempt in range(1, max_attempts + 1):
             try:
-                resp = OLLAMA_CLIENT.chat(
-                    model=CFG.ollama_model,
-                    messages=messages,
-                    stream=stream,
-                    options={
-                        "temperature": temperature,
-                        "num_ctx": ctx,
-                        "num_predict": num_predict,
-                        "num_thread": CFG.ollama_num_thread,
-                    },
-                    keep_alive=CFG.ollama_keep_alive,
-                )
+                resp = _request_once(stream, effective_num_predict, ctx)
                 if not stream:
-                    return cast(Any, resp)["message"]["content"]
+                    text = _resp_message_content(resp)
+                    return _recover_if_empty_content(text, ctx, effective_num_predict)
 
                 out_parts: list[str] = []
+                shown_thinking_header = False
                 for chunk in cast(Any, resp):
-                    token = cast(Any, chunk)["message"]["content"]
+                    chunk_obj = cast(Any, chunk)
+                    thought_token = _resp_message_thinking(chunk_obj)
+                    if show_thinking and thought_token:
+                        if not shown_thinking_header:
+                            sys.stdout.write("\n[thinking]\n")
+                            shown_thinking_header = True
+                        sys.stdout.write(thought_token)
+                        sys.stdout.flush()
+
+                    token = _resp_message_content(chunk_obj)
                     if token:
+                        if shown_thinking_header:
+                            sys.stdout.write("\n\n[answer]\n")
+                            shown_thinking_header = False
                         out_parts.append(token)
                         sys.stdout.write(token)
                         sys.stdout.flush()
+                full_text = "".join(out_parts)
+                recovered = _recover_if_empty_content(full_text, ctx, effective_num_predict)
+                if not full_text.strip() and recovered.strip():
+                    if show_thinking:
+                        sys.stdout.write("\n[answer]\n")
+                    sys.stdout.write(recovered)
+                    sys.stdout.flush()
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return "".join(out_parts)
+                return recovered
             except Exception as exc:
                 if attempt < max_attempts and _is_retryable_ollama_error(exc):
                     logger.warning("Transient Ollama error (%s). Resetting client and retrying once.", type(exc).__name__)
@@ -1610,7 +1675,10 @@ def _choose_num_predict(query: str, turn_profile: dict[str, Any], *, has_docs: b
     if not has_docs and not has_web_results and _query_complexity_score(query) < 0.35:
         cap = min(cap, 96)
 
-    return max(64, min(base_predict, cap))
+    selected = max(64, min(base_predict, cap))
+    if "thinking" in CFG.ollama_model.lower():
+        selected = max(192, selected)
+    return selected
 
 
 def _retrieve_docs_cached(
@@ -3277,6 +3345,7 @@ def chat() -> None:
                 temperature=CFG.ollama_chat_temperature,
                 num_predict=active_num_predict,
                 num_ctx=active_num_ctx,
+                show_thinking=CFG.ollama_show_thinking,
                 stream=True,
             )
 
@@ -3372,6 +3441,7 @@ def stress_local_file(path_arg: str) -> None:
                         temperature=CFG.ollama_chat_temperature,
                         num_predict=effective_num_predict,
                         num_ctx=CFG.ollama_chat_num_ctx,
+                        show_thinking=False,
                         stream=False,
                     )
                     elapsed = time.perf_counter() - t0
