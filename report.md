@@ -1,3 +1,16 @@
+## 2026-04-23 14:30:28 IST
+
+Task summary:
+Fixed router logic inversions that were causing normal queries to still trigger web searches. Corrected two critical bugs: (1) _should_web_search() was returning True when should_skip_web_auto_routing() returned True (logic inverted), (2) auto web fallback condition was checking router_decision.source != 'internal_knowledge' instead of == 'web_search', which allowed web even when router decided on internal knowledge. Expanded should_skip_web_auto_routing() pattern matching to catch educational queries like "can you help me with math?", "teach me", "how to", etc. All 9 test cases pass.
+
+Commit:
+Fix router logic inversions: prevent normal queries from triggering web search
+
+- Fixed _should_web_search() logic inversion: now returns False when should_skip_web_auto_routing() returns True
+- Fixed auto web fallback condition: only allows web when router_decision.source == 'web_search'
+- Expanded should_skip_web_auto_routing() patterns to catch broader educational queries
+- Validated with 9 test cases: all passing
+
 ## 2026-04-23 14:23:15 IST
 
 Task summary:
