@@ -2649,7 +2649,7 @@ def _should_web_search(query: str) -> bool:
         return False
     # Skip web for generic educational/conceptual questions.
     if should_skip_web_auto_routing(query):
-        return True
+        return False
     # Router decision runs later in chat() with retrieval quality context.
     return False
 
@@ -3303,7 +3303,7 @@ def chat() -> None:
             and "Web search" not in tool_results
             and (force_web_fallback or _should_web_search(cleaned_query))
             and len(cleaned_query.split()) >= max(1, CFG.auto_web_min_query_words)
-            and (router_decision is None or router_decision.source != "internal_knowledge")
+            and (router_decision is None or router_decision.source == "web_search")
             and (len(doc_chunks) == 0 or retrieval_evidence < (turn_profile["evidence_threshold"] * 0.70))
         ):
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):
