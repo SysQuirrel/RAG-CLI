@@ -1,3 +1,15 @@
+## 2026-04-23 14:55:00 IST
+
+Task summary:
+Enabled visible thinking output for the default chat model and disabled automatic web fallback on normal turns to improve perceived response start time. Increased the minimum words required for auto web routing so short conversational and educational prompts stay local.
+
+Commit:
+Tune chat defaults for faster response start and visible thinking
+
+- Set OLLAMA_SHOW_THINKING=true
+- Added AUTO_WEB_FALLBACK_ON_EMPTY_DOCS=false
+- Added AUTO_WEB_MIN_QUERY_WORDS=8
+
 ## 2026-04-23 14:30:28 IST
 
 Task summary:
