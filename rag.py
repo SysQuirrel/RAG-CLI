@@ -109,6 +109,7 @@ try:
 except ImportError:
     HAS_BM25 = False
 from runtime_features import WebSearchCache, SessionRecorder
+from query_router import route_query, RouterDecision, should_skip_web_auto_routing
 
 # Optional local web RAG pipeline; rag.py falls back to provider tools if absent.
 try:
@@ -2640,24 +2641,16 @@ def _is_command_help_question(query: str) -> bool:
 
 
 def _should_web_search(query: str) -> bool:
+    """CHANGED: Uses smart router integration instead of broad keyword triggers."""
     # Deterministic local-first guard: if a local file is referenced, do not auto-route to web.
     if _extract_local_file_refs(query):
         return False
     if _is_meta_web_capability_question(query) or _is_command_help_question(query):
         return False
-    triggers = [
-        "latest", "recent", "cve-", "patch", "news", "today", "current", "new exploit",
-        "poc", "writeup", "internet", "online", "web", "up-to-date", "update", "updates",
-        "github", "stackoverflow", "reddit", "docs", "statistics", "data", "price",
-        "release", "announcement", "2024", "2025", "2026",
-    ]
-    q = query.lower()
-    if any(t in q for t in triggers):
+    # Skip web for generic educational/conceptual questions.
+    if should_skip_web_auto_routing(query):
         return True
-    if "?" in q and any(x in q for x in ["what is", "how to", "which", "who is", "where is", "tell me about"]):
-        return True
-    if len(q.split()) >= 6 and any(x in q for x in ["what", "which", "how", "can", "should"]):
-        return True
+    # Router decision runs later in chat() with retrieval quality context.
     return False
 
 
@@ -3097,6 +3090,9 @@ def chat() -> None:
         # Tool execution
         tool_results: dict[str, str] = {}
         web_only_mode = False
+        router_decision: RouterDecision | None = None
+        web_fallback_allowed = bool(turn_profile.get("allow_web_fallback", True))
+        force_web_fallback = False
 
         # If the user issued an explicit command, run the corresponding tool(s) first.
         t_tools = time.perf_counter()
@@ -3281,6 +3277,20 @@ def chat() -> None:
                     mem_turns = []
         timing["retrieve_ms"] = (time.perf_counter() - t_retrieve) * 1000
 
+        # [NEW] Smart router: decide source using query + retrieval quality.
+        if not cmd and not local_only_turn:
+            router_decision = route_query(cleaned_query, doc_chunks, quality_threshold=0.55)
+            console.print(
+                f"[dim]Route: {router_decision.source} (confidence={router_decision.confidence:.2f}) — "
+                f"{router_decision.reasoning}[/dim]"
+            )
+            if router_decision.source == "internal_knowledge":
+                web_fallback_allowed = False
+                console.print("[dim]Using LLM internal knowledge (no auto web fallback).[/dim]")
+            elif router_decision.source == "rag":
+                web_fallback_allowed = False
+            force_web_fallback = bool(router_decision.force_web)
+
         prompt_history = [] if local_only_turn else conversation_history
 
         # Auto web fallback if no strong local docs are found for this turn.
@@ -3289,10 +3299,11 @@ def chat() -> None:
             and _any_web_provider_available()
             and not cmd
             and not local_only_turn
-            and bool(turn_profile["allow_web_fallback"])
+            and web_fallback_allowed
             and "Web search" not in tool_results
-            and _should_web_search(cleaned_query)
+            and (force_web_fallback or _should_web_search(cleaned_query))
             and len(cleaned_query.split()) >= max(1, CFG.auto_web_min_query_words)
+            and (router_decision is None or router_decision.source != "internal_knowledge")
             and (len(doc_chunks) == 0 or retrieval_evidence < (turn_profile["evidence_threshold"] * 0.70))
         ):
             with console.status("[dim]No strong local docs; checking web...[/dim]", spinner="dots"):

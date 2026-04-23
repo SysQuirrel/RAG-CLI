@@ -1,3 +1,15 @@
+## 2026-04-23 14:23:15 IST
+
+Task summary:
+Integrated smart router controls into rag.py so ambiguous/generic educational prompts no longer auto-trigger web ingestion. Updated _should_web_search to be conservative, wired route_query-based source decisions after retrieval, and gated auto web fallback with router decision flags (including force_web). Validated behavior with router unit checks and py_compile.
+
+Commit:
+Integrate smart router-based web fallback control
+
+Import query_router routing helpers into rag.py and remove broad keyword-based auto web trigger behavior from _should_web_search.
+Add router_decision, web_fallback_allowed, and force_web_fallback flow in chat() after retrieval to choose between internal knowledge, RAG, and web fallback.
+Gate auto web fallback with router outcome so generic prompts stay local while time-bound queries can still force web.
+
 ## 2026-04-22 14:16:33 IST
 
 Task summary:
