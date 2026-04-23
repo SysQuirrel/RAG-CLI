@@ -1,3 +1,16 @@
+## 2026-04-23 10:05:00 IST
+
+Task summary:
+Reduced the thinking-model generation budgets from 16384 to stable values so the chat no longer stops abruptly after a few thinking lines. Kept visible thinking enabled and preserved conservative web fallback settings.
+
+Commit:
+Stabilize thinking-mode generation budgets
+
+- Set OLLAMA_CHAT_NUM_CTX=8192
+- Set OLLAMA_CHAT_NUM_CTX_WEB=3072
+- Set OLLAMA_CHAT_NUM_PREDICT=512
+- Set OLLAMA_CHAT_NUM_PREDICT_LOCAL_BONUS=256
+
 ## 2026-04-23 14:55:00 IST
 
 Task summary:
