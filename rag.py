@@ -207,11 +207,13 @@ class Config:
     ollama_host: str = field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))  # Ollama server URL used for generation and embedding.
     # [FIX-5] Raise ctx window — phi4-mini supports 4k+; don't starve the model
     ollama_chat_num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX", 16386))  # Context window for normal chat turns.
-    ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 6144))  # Smaller context budget for web-augmented turns.
-    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 220))  # Max tokens to generate per reply.
-    ollama_chat_num_predict_local_bonus: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT_LOCAL_BONUS", 220))  # Extra generation budget for local-file turns.
+    ollama_chat_num_ctx_web: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_CTX_WEB", 8192))  # Smaller context budget for web-augmented turns.
+    ollama_chat_num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT", 8192))  # Max tokens to generate per reply.
+    ollama_chat_num_predict_local_bonus: int = field(default_factory=lambda: _env_int("OLLAMA_CHAT_NUM_PREDICT_LOCAL_BONUS", 512))  # Extra generation budget for local-file turns.
     ollama_chat_temperature: float = field(default_factory=lambda: _env_float("OLLAMA_CHAT_TEMPERATURE", 0.2))  # Randomness level for answer style.
     ollama_show_thinking: bool = field(default_factory=lambda: _env_bool("OLLAMA_SHOW_THINKING", True))  # Show model reasoning stream when available.
+    ollama_thinking_chunk_limit: int = field(default_factory=lambda: _env_int("OLLAMA_THINKING_CHUNK_LIMIT", 80))  # Max thinking-only chunks before forcing answer recovery.
+    ollama_thinking_max_sec: float = field(default_factory=lambda: _env_float("OLLAMA_THINKING_MAX_SEC", 6.0))  # Max seconds to allow thinking-only stream before forcing answer recovery.
     ollama_keep_alive: str = "10m"  # Keep the model warm between turns to reduce reload latency.
     ollama_num_thread: int = field(default_factory=lambda: max(1, (os.cpu_count() or 4) - 1))  # CPU threads reserved for Ollama inference.
 
@@ -1291,7 +1293,7 @@ def generate_chat_response(
         if initial_text.strip():
             return initial_text
         # Thinking models can consume the budget before emitting final content.
-        escalations = [max(256, int(base_predict) * 2), 384, 640]
+        escalations = [max(256, min(512, int(base_predict) + 128)), 640]
         tried: set[int] = set()
         for boosted_predict in escalations:
             if boosted_predict in tried or boosted_predict <= int(base_predict):
@@ -1329,9 +1331,22 @@ def generate_chat_response(
 
                 out_parts: list[str] = []
                 shown_thinking_header = False
+                thinking_chunks_without_answer = 0
+                thinking_started_at: float | None = None
+                forced_thinking_guard = False
                 for chunk in cast(Any, resp):
                     chunk_obj = cast(Any, chunk)
                     thought_token = _resp_message_thinking(chunk_obj)
+                    token = _resp_message_content(chunk_obj)
+
+                    if thought_token and not token:
+                        thinking_chunks_without_answer += 1
+                        if thinking_started_at is None:
+                            thinking_started_at = time.perf_counter()
+                    elif token:
+                        thinking_chunks_without_answer = 0
+                        thinking_started_at = None
+
                     if show_thinking and thought_token:
                         if not shown_thinking_header:
                             sys.stdout.write("\n[thinking]\n")
@@ -1339,7 +1354,32 @@ def generate_chat_response(
                         sys.stdout.write(thought_token)
                         sys.stdout.flush()
 
-                    token = _resp_message_content(chunk_obj)
+                    if thinking_chunks_without_answer >= max(20, CFG.ollama_thinking_chunk_limit):
+                        logger.warning(
+                            "Thinking-only stream exceeded %s chunks at num_ctx=%s; forcing answer recovery.",
+                            CFG.ollama_thinking_chunk_limit,
+                            ctx,
+                        )
+                        if show_thinking:
+                            sys.stdout.write("\n\n[answer]\n")
+                            sys.stdout.flush()
+                            shown_thinking_header = False
+                        forced_thinking_guard = True
+                        break
+
+                    if thinking_started_at is not None and (time.perf_counter() - thinking_started_at) >= max(1.0, float(CFG.ollama_thinking_max_sec)):
+                        logger.warning(
+                            "Thinking-only stream exceeded %.1fs at num_ctx=%s; forcing answer recovery.",
+                            float(CFG.ollama_thinking_max_sec),
+                            ctx,
+                        )
+                        if show_thinking:
+                            sys.stdout.write("\n\n[answer]\n")
+                            sys.stdout.flush()
+                            shown_thinking_header = False
+                        forced_thinking_guard = True
+                        break
+
                     if token:
                         if shown_thinking_header:
                             sys.stdout.write("\n\n[answer]\n")
@@ -1348,6 +1388,15 @@ def generate_chat_response(
                         sys.stdout.write(token)
                         sys.stdout.flush()
                 full_text = "".join(out_parts)
+                if forced_thinking_guard and not full_text.strip():
+                    recovered = (
+                        "I can help right away. Please ask a specific question in one sentence, "
+                        "and I will answer directly."
+                    )
+                    sys.stdout.write(recovered)
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return recovered
                 recovered = _recover_if_empty_content(full_text, ctx, effective_num_predict)
                 if not full_text.strip() and recovered.strip():
                     if show_thinking:

@@ -1,3 +1,16 @@
+## 2026-04-24 21:47:24 IST
+
+Task summary:
+Implemented a hard safeguard against long thinking-only streams in rag.py so chat turns no longer hang until timeout. Added both chunk-count and elapsed-time guards for thinking-only output, plus an immediate deterministic fallback answer when no final answer tokens arrive after guard trigger. Also added OLLAMA_THINKING_MAX_SEC and OLLAMA_THINKING_CHUNK_LIMIT controls in .env. Verified with timed pipeline runs: the previous 35s timeout was eliminated (exit code 0), and both normal and small queries now return in ~22s with guard-triggered recovery instead of abrupt stop.
+
+Commit:
+Add thinking-only stream guard and fast recovery fallback
+
+- Added OLLAMA_THINKING_CHUNK_LIMIT config in rag.py and .env
+- Added OLLAMA_THINKING_MAX_SEC config in rag.py and .env
+- Enforced thinking-only chunk/time guard during streaming generation
+- Added immediate fallback answer when guard triggers and no answer tokens are produced
+
 ## 2026-04-23 10:05:00 IST
 
 Task summary:
