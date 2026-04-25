@@ -1,215 +1,219 @@
-# RAG Pipeline — Web Retrieval System
+# RAG CLI
 
-A modular, production-ready pipeline that searches the web, crawls pages,
-extracts content, and stores it in a local vector database for RAG retrieval.
+Local-first RAG assistant for terminal workflows, with a modular web-ingestion pipeline.
 
+This project combines:
+- An interactive chat CLI powered by Ollama and ChromaDB
+- Hybrid retrieval (dense + BM25-style sparse)
+- Optional live web grounding through multiple providers
+- A standalone search/crawl/extract/embed pipeline for building local knowledge bases
+
+## Why This Project
+
+RAG systems often fail in one of two ways: they are either fast but shallow, or powerful but fragile.
+This codebase focuses on practical balance:
+- Strong local-first behavior for speed and privacy
+- Optional web augmentation when recency is needed
+- Retrieval quality upgrades that improve answer grounding
+- Operational tooling for memory, docs cleanup, stress testing, and runtime monitoring
+
+## Architecture
+
+Two primary execution paths live in the same repository.
+
+### 1) Chat Path (rag.py)
+
+query -> retrieve local docs/memory -> optional web context -> compose prompt -> Ollama response
+
+### 2) Ingestion Path (pipeline.py)
+
+search -> crawl -> extract -> chunk -> embed -> store -> retrieve
+
+## Core Features
+
+- Terminal chat assistant with local vector memory
+- File ingestion from local sources (PDF/text/markdown and directories)
+- Web tools inside chat:
+    - /web for forced web search
+    - /fetch for full-page text retrieval
+    - /weather and /cve helper commands
+    - /dns and provider strategy tooling
+- Docs maintenance commands (list, prune suspicious chunks, clear index)
+- Memory controls (list/clear)
+- Session export (markdown/json)
+- Resource monitor controls during chat
+- Stress profile runner for local file QA
+- Optional Modal workflow via modal_pipeline.py
+
+## Tech Stack
+
+- Python 3.12+
+- Ollama for generation/embedding serving
+- ChromaDB for persistent vector storage
+- Sentence Transformers for local embeddings
+- Tavily, SerpAPI, LangSearch, Jina, Firecrawl integrations
+- Rich terminal UI
+
+## Project Layout
+
+- rag.py: Main CLI assistant (chat, ingest, docs, memory, stress, tools)
+- pipeline.py: Modular ingestion/retrieval pipeline CLI
+- config.py: Pipeline config loaded from .env
+- crawler.py: Search + crawl stage
+- extractor.py: Content extraction and chunking pipeline stages
+- embedder.py: Embedding + Chroma storage
+- retriever.py: Retrieval formatting and ranking output
+- query_router.py: Query routing and web/local decision heuristics
+- runtime_features.py: Runtime caching/session helpers
+- modal_pipeline.py: Optional remote execution path
+- .env.example: Safe environment template (no secrets)
+
+## Quick Start
+
+### 1. Create environment and install dependencies
+
+Using uv (recommended):
+
+```bash
+uv sync
 ```
-search → crawl → extract → chunk → embed → store → retrieve
-```
 
----
-
-## Project Structure
-
-```
-rag_pipeline/
-├── config.py            # Central config (loaded from .env)
-├── crawler.py           # Stage 1a+1b: Web search (Tavily/LangSearch) and crawling
-├── extractor.py         # Stage 2–4: Content extraction, structuring, and chunking
-├── embedder.py          # Stage 5+6: Embedding & ChromaDB storage
-├── retriever.py         # Query interface
-├── pipeline.py          # Orchestrator + CLI
-├── modal_pipeline.py    # Optional: Modal.com for remote scaling
-└── .env.example
-```
-
----
-
-## Setup
-
-### 1. Clone and create a virtual environment
+Using venv + pip:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate
+pip install -e .
 ```
 
-### 2. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-> **Note on sentence-transformers**: The model (`all-MiniLM-L6-v2`, ~80 MB)
-> downloads automatically on first run. It runs fully on CPU.
-
-### 3. Configure API keys
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env and add your keys:
-#   TAVILY_API_KEY=...
-#   FIRECRAWL_API_KEY=...      (optional — for JS-heavy sites)
-#   LANGSEARCH_API_KEY=...     (optional — fallback search)
 ```
 
----
+Edit .env with your local keys and runtime preferences.
 
-## Usage
-
-### Ingest content for a topic
+### 3. Start the assistant
 
 ```bash
-python pipeline.py ingest "Python async programming best practices"
+uv run python rag.py chat
 ```
 
-Options:
-```
---max-results N    Number of search results to use as seeds (default: 10)
---max-pages N      Total pages to crawl (default: 30)
---max-depth N      Link-follow depth (default: 2)
---firecrawl        Use Firecrawl for JS-heavy sites
---no-save          Don't write documents.jsonl
-```
-
-Example — crawl documentation site deeply:
-```bash
-python pipeline.py ingest "FastAPI middleware" --max-depth 3 --max-pages 50
-```
-
-Example — JS-heavy site via Firecrawl:
-```bash
-python pipeline.py ingest "React Server Components" --firecrawl
-```
-
----
-
-### Query the knowledge base
+Shortcut (chat is default):
 
 ```bash
-python pipeline.py query "how do I handle rate limits in async Python?"
+uv run python rag.py
 ```
 
-Options:
-```
---top-k N          Number of results (default: 6)
---min-score F      Minimum similarity score, 0–1 (default: 0.30)
---domain DOMAIN    Filter to specific domain (e.g. docs.python.org)
---json             Output raw JSON instead of formatted context
-```
+## CLI Usage
 
-Example — domain-specific query:
-```bash
-python pipeline.py query "dependency injection" --domain fastapi.tiangolo.com
-```
-
----
-
-### Check collection stats
+### Main assistant (rag.py)
 
 ```bash
+uv run python rag.py chat
+uv run python rag.py ingest <file_or_dir>
+uv run python rag.py docs list
+uv run python rag.py docs prune
+uv run python rag.py docs clear
+uv run python rag.py memory list
+uv run python rag.py memory clear
+uv run python rag.py sources clean <file1> <file2>
+uv run python rag.py stress <file>
+```
+
+### Chat slash commands
+
+- /web <query>: force web search
+- /fetch <url>: fetch page text
+- /weather <city>: weather lookup
+- /cve <CVE-ID>: NVD lookup
+- /dns <domain>: DNS recon helper
+- /strategy <query>: inspect provider strategy
+- /providers: provider readiness view
+- /monitor <cmd>: runtime monitor control
+- /export <md|json>: export session
+- /clear: clear terminal
+- /help: command reference
+
+### Pipeline mode (pipeline.py)
+
+```bash
+python pipeline.py ingest "your topic"
+python pipeline.py query "your question"
 python pipeline.py stats
 ```
 
----
+Useful ingest flags:
 
-## Use as a Python module
+- --max-results: number of seed results
+- --max-pages: crawl cap
+- --max-depth: link depth
+- --firecrawl: prefer JS-friendly crawl path
+- --no-save: skip documents.jsonl output
+
+## Python API Examples
 
 ```python
 from pipeline import run_ingest, run_query
 
-# Ingest
 summary = run_ingest("machine learning deployment strategies", max_search_results=5)
-
-# Query
 results = run_query("how to serve ML models in production?", top_k=5)
+
 for r in results:
-    print(f"[{r['score']:.3f}] {r['title']}")
-    print(f"  {r['url']}")
-    print(f"  {r['text'][:200]}…\n")
+        print(r["score"], r["title"], r["url"])
 ```
 
----
+## Configuration Notes
 
-## Using with an LLM
+The repository includes many env-tunable knobs. Key groups:
 
-```python
-from pipeline import run_query
-from retriever import retrieve, format_context
+- Model + generation:
+    - OLLAMA_MODEL
+    - OLLAMA_CHAT_NUM_CTX
+    - OLLAMA_CHAT_NUM_PREDICT
+    - OLLAMA_SHOW_THINKING
+- Retrieval + chunking:
+    - EMBED_MODEL
+    - CHUNK_SIZE / CHUNK_OVERLAP
+    - TOP_K_DOCS / DOC_MIN_SCORE
+- Web routing + providers:
+    - AUTO_WEB_FALLBACK_ON_EMPTY_DOCS
+    - WEB_SEARCH_PROVIDER
+    - TAVILY_API_KEY / SERPAPI_API_KEY / LANGSEARCH_API_KEY / JINA_API_KEY / FIRECRAWL_API_KEY
 
-# Get formatted context block ready for LLM prompt injection
-results = retrieve("what are the best chunking strategies for RAG?")
-context = format_context(results)
+Use separate CHROMA_DB_PATH values when changing embedding models so vector spaces do not mix.
 
-# Use context in your LLM call
-prompt = f"""Answer the question using only the provided context.
+## Safety and Publishing
 
-Context:
-{context}
-
-Question: What are the best chunking strategies for RAG?
-Answer:"""
-
-# Pass `prompt` to your LLM of choice (OpenAI, Anthropic, etc.)
-```
-
----
-
-## Optional: Scale with Modal
-
-For large ingestion jobs (hundreds of URLs, scheduled pipelines):
-
-```bash
-pip install modal
-modal token new                  # authenticate once
-
-# Deploy
-modal deploy modal_pipeline.py
-
-# Run remote ingest
-modal run modal_pipeline.py::ingest_remote --query "your topic"
-```
-
-Add your API keys to Modal Secrets (dashboard → Secrets → Create secret group
-named `rag-api-keys`) with the same variable names as in `.env`.
-
----
-
-## Configuration Reference
-
-All settings can be overridden in `.env`:
-
-| Variable             | Default             | Description                          |
-|----------------------|---------------------|--------------------------------------|
-| `TAVILY_API_KEY`     | —                   | Required (or LANGSEARCH_API_KEY)     |
-| `FIRECRAWL_API_KEY`  | —                   | Optional, for JS-heavy sites         |
-| `LANGSEARCH_API_KEY` | —                   | Optional, fallback search            |
-| `CHROMA_DB_PATH`     | `./chroma_db`       | Where ChromaDB persists data         |
-| `EMBEDDING_MODEL`    | `all-MiniLM-L6-v2`  | Sentence-transformers model name     |
-| `CHUNK_SIZE`         | `500`               | Characters per chunk                 |
-| `CHUNK_OVERLAP`      | `75`                | Overlap between consecutive chunks   |
-| `CRAWL_MAX_DEPTH`    | `2`                 | Link-follow depth from seed URLs     |
-| `CRAWL_MAX_PAGES`    | `30`                | Hard cap on total pages crawled      |
-| `RETRIEVAL_TOP_K`    | `6`                 | Chunks returned per query            |
-| `RETRIEVAL_MIN_SCORE`| `0.30`              | Minimum cosine similarity threshold  |
-
----
+- Never commit real .env secrets
+- Keep local DB/index artifacts out of git
+- Rotate keys immediately if a credential was ever committed
+- Use .env.example as the only shared configuration template
 
 ## Troubleshooting
 
-**Empty results after ingest**
-- Check `pipeline.log` for extraction failures
-- Lower `RETRIEVAL_MIN_SCORE` to `0.20` and retry the query
-- Inspect `documents.jsonl` to verify content was extracted
+### No results or weak answers
 
-**Short content / mostly navigation text**
-- Add `--firecrawl` flag for sites that require JS rendering
-- Check if the site requires authentication (pipeline won't handle login walls)
+- Re-ingest your source files
+- Raise top-k or lower minimum score
+- Confirm your embedding model and Chroma path are consistent
 
-**Slow embedding**
-- Normal on first run (model download). Subsequent runs are faster.
-- Reduce `EMBEDDING_BATCH_SIZE` in config.py if you hit memory issues
+### Web features not working
 
-**ChromaDB errors on re-ingest**
-- The pipeline uses `upsert` so re-running is safe and updates existing chunks
-- To start fresh: `rm -rf ./chroma_db`
+- Check API keys in .env
+- Verify provider selection variables
+- Use /providers and /strategy in chat for diagnostics
+
+### Slow first run
+
+- Embedding models may download on first execution
+- Keep Ollama model warm using existing keep-alive settings
+
+## Optional Remote Scaling
+
+If you need remote ingestion execution, use modal_pipeline.py with Modal.
+
+## License
+
+See LICENSE in this repository if present.
