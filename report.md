@@ -1,3 +1,21 @@
+## 2026-04-25 11:54:49 IST
+
+Task summary:
+Rewrote README.md into a polished, comprehensive project guide covering architecture, features, setup, command usage for both rag.py and pipeline.py, environment configuration guidance, safety practices, troubleshooting, and optional scaling notes.
+
+Commit:
+Rewrite README with complete project guide
+Hash: 43b0220
+
+## 2026-04-25 11:51:13 IST
+
+Task summary:
+Hardened the repository for safe GitHub publishing by preventing future tracking of local database artifacts, untracking existing sensitive local files from git, and adding a share-safe environment template. Specifically, added ignore rules for chroma_db and sqlite/db files, removed .env and chroma_db artifacts from tracking while keeping local files available, and created .env.example with placeholder values only.
+
+Commit:
+Harden repository secrets and local index tracking
+Hash: d2f521b
+
 ## 2026-04-24 21:47:24 IST
 
 Task summary:
