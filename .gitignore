@@ -55,3 +55,11 @@ Thumbs.db
 # Local memory files
 memory_1.md
 memory_2.md
+FEATURES_AND_PIPELINE.md
+report.md
+
+# Local vector database artifacts
+chroma_db/
+*.sqlite
+*.sqlite3
+*.db
